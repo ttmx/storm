@@ -1,4 +1,4 @@
-<img src="assets/icon.png" width="64" height="64" alt="">
+<img src="assets/banner.png" width="100%" alt="storm">
 
 Storm stands for [S]lop [tor]rent [m]m  
 # storm
