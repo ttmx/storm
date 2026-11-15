@@ -23,6 +23,9 @@ pub struct Prefs {
     /// The torrent list's sort column (see [`Col::key`]); `None` = order added.
     pub sort_column: Option<String>,
     pub sort_descending: bool,
+    /// Columns hidden from the torrent list (see [`Col::key`]). Hidden rather
+    /// than shown, so columns added later appear by default.
+    pub hidden_columns: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -33,6 +36,7 @@ impl Default for Prefs {
             filter: Filter::All.key().into(),
             sort_column: None,
             sort_descending: false,
+            hidden_columns: Vec::new(),
         }
     }
 }
@@ -68,6 +72,11 @@ impl Prefs {
         let col = Col::from_key(self.sort_column.as_deref()?)?;
         Some((col, if self.sort_descending { ColumnSort::Descending } else { ColumnSort::Ascending }))
     }
+
+    /// The saved hidden columns; unknown keys are skipped.
+    pub fn hidden_columns(&self) -> Vec<Col> {
+        self.hidden_columns.iter().filter_map(|k| Col::from_key(k)).collect()
+    }
 }
 
 /// Remembers the active quick filter.
@@ -87,6 +96,11 @@ pub fn set_table_sort(cx: &mut App, sort: Option<(Col, ColumnSort)>) {
             p.sort_descending = false;
         }
     });
+}
+
+/// Remembers which torrent-list columns are hidden.
+pub fn set_hidden_columns(cx: &mut App, hidden: &[Col]) {
+    Prefs::update(cx, |p| p.hidden_columns = hidden.iter().map(|c| c.key().into()).collect());
 }
 
 /// Whether the clipboard watcher is enabled ("Watch clipboard for magnet links").
@@ -158,5 +172,16 @@ mod tests {
         assert!(!p.watch_clipboard);
         assert_eq!(p.filter(), Filter::All);
         assert_eq!(p.table_sort(), None);
+    }
+
+    #[test]
+    fn hidden_columns_round_trip_and_skip_unknown_keys() {
+        let p = Prefs { hidden_columns: vec![Col::Eta.key().into(), Col::Ratio.key().into()], ..Prefs::default() };
+        let p: Prefs = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(p.hidden_columns(), vec![Col::Eta, Col::Ratio]);
+
+        let p: Prefs = serde_json::from_str(r#"{"hidden_columns":["nope","peers"]}"#).unwrap();
+        assert_eq!(p.hidden_columns(), vec![Col::Peers]);
+        assert!(Prefs::default().hidden_columns().is_empty());
     }
 }

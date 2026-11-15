@@ -54,8 +54,15 @@ gpui_kit::actions!(
         ClearSelection,
         OpenSelected,
         TogglePause,
+        // The torrent list's header menu.
+        ResetColumns,
     ]
 );
+
+/// Shows or hides a column of the torrent list (from its header menu).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = storm, no_json)]
+pub struct ToggleColumn(pub Col);
 
 const CONTEXT: &str = "StormApp";
 
@@ -185,6 +192,7 @@ impl StormApp {
     ) -> Parts {
         let handle = BackendHandle::get(cx);
         let backend = handle.backend;
+        let hidden = Prefs::get(cx).hidden_columns();
         let state = cx.new(|cx| AppState::new(backend, cx));
         let table = cx.new(|cx| {
             let mut delegate = TorrentTableDelegate::new();
@@ -193,6 +201,8 @@ impl StormApp {
             delegate.set_filter(filter);
             delegate.set_query(query);
             delegate.set_sort(sort);
+            // After the sort, so a sort on a hidden column is dropped.
+            delegate.set_hidden_columns(&hidden);
             TableState::new(delegate, window, cx)
                 // We keep our own multi-selection in the delegate.
                 .row_selectable(false)
@@ -212,11 +222,13 @@ impl StormApp {
                 this.sync_selection(cx);
                 cx.notify();
             }),
-            cx.subscribe(&table, |this, table, ev: &TableEvent, cx| match ev {
+            cx.subscribe_in(&table, window, |this, table, ev: &TableEvent, window, cx| match ev {
                 TableEvent::SelectRow(_) | TableEvent::ClearSelection => {
                     this.sync_selection(cx);
                     cx.notify();
                 }
+                // The click already selected just that row.
+                TableEvent::DoubleClickedRow(_) => this.open_folder(&OpenFolder, window, cx),
                 // A column edge was dragged: Name gives or takes the difference.
                 TableEvent::ColumnWidthsChanged(widths) => table.update(cx, |t, cx| {
                     if t.delegate_mut().set_widths(widths) {
@@ -430,6 +442,41 @@ impl StormApp {
         });
         self.sync_selection(cx);
         cx.notify();
+    }
+
+    fn toggle_column(&mut self, action: &ToggleColumn, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_columns(window, cx, |d| d.toggle_column(action.0));
+    }
+
+    fn reset_columns(&mut self, _: &ResetColumns, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_columns(window, cx, TorrentTableDelegate::reset_columns);
+    }
+
+    /// Applies a change to the shown columns and remembers the result, including
+    /// a sort that hiding its column cleared. Runs from the header menu, outside
+    /// the table's update.
+    fn change_columns(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut TorrentTableDelegate) -> bool,
+    ) {
+        let changed = self.table.update(cx, |t, cx| {
+            let changed = change(t.delegate_mut());
+            if changed {
+                t.refresh(cx);
+                cx.notify();
+            }
+            changed
+        });
+        if changed {
+            let d = self.table.read(cx).delegate();
+            let (hidden, sort) = (d.hidden_columns(), d.sort());
+            prefs::set_hidden_columns(cx, &hidden);
+            prefs::set_table_sort(cx, sort);
+        }
+        // The menu took the keyboard; give it back to the list.
+        self.focus_list(window, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -801,6 +848,8 @@ impl Render for StormApp {
             .on_action(cx.listener(Self::toggle_pause))
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::clear_selection))
+            .on_action(cx.listener(Self::toggle_column))
+            .on_action(cx.listener(Self::reset_columns))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_cursor(Move::Up, false, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(Move::Down, false, cx)))
             .on_action(cx.listener(|this, _: &SelectPageUp, _, cx| this.move_cursor(Move::PageUp(0), false, cx)))

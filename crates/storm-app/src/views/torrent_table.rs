@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_kit::component::menu::PopupMenu;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use storm_proto::{TorrentId, TorrentState, TorrentSummary};
 
 use crate::app::{
-    CopyInfoHash, CopyMagnet, OpenFolder, PauseSelected, RemoveSelected, RemoveSelectedWithData, ResumeSelected,
+    CopyInfoHash, CopyMagnet, OpenFolder, PauseSelected, RemoveSelected, RemoveSelectedWithData, ResetColumns,
+    ResumeSelected, ToggleColumn,
 };
 use crate::format;
 use crate::state::{Filter, matches_query};
@@ -58,6 +59,11 @@ impl Col {
             _ if self.right_aligned() => c.text_right(),
             _ => c,
         }
+    }
+
+    /// Position in [`COLUMNS`], which lists the variants in declaration order.
+    fn ix(self) -> usize {
+        self as usize
     }
 
     fn default_width(self) -> Pixels {
@@ -293,7 +299,10 @@ pub struct TorrentTableDelegate {
     pub action_context: Option<FocusHandle>,
     /// Offer "Open folder" (the backend shares our filesystem).
     pub can_open_folder: bool,
+    /// The columns shown, in [`COLUMNS`] order; Name always is, and comes first.
+    visible: Vec<Col>,
     /// Current column widths (the user may drag them), in [`COLUMNS`] order.
+    /// Hidden columns keep theirs for when they're shown again.
     widths: [Pixels; COLUMNS.len()],
     /// The table's width at the last fit; Name takes what the others leave.
     fit_width: Option<Pixels>,
@@ -321,6 +330,7 @@ impl TorrentTableDelegate {
             selection: Selection::default(),
             action_context: None,
             can_open_folder: false,
+            visible: COLUMNS.to_vec(),
             widths: COLUMNS.map(Col::default_width),
             fit_width: None,
         }
@@ -348,25 +358,101 @@ impl TorrentTableDelegate {
         self.refit()
     }
 
-    /// Takes over the widths after the user dragged a column edge, and refits
-    /// Name to the rest. Returns whether the table needs a `refresh`.
+    /// Takes over the widths after the user dragged a column edge (given in
+    /// displayed order), and refits Name to the rest. Returns whether the
+    /// table needs a `refresh`.
     pub fn set_widths(&mut self, widths: &[Pixels]) -> bool {
-        for (w, new) in self.widths.iter_mut().zip(widths) {
-            *w = *new;
+        // Widths from before a column was shown or hidden would land on the wrong columns.
+        if widths.len() != self.visible.len() {
+            return false;
+        }
+        for (col, w) in self.visible.iter().zip(widths) {
+            self.widths[col.ix()] = *w;
         }
         self.refit();
-        // The table already shows what was dragged; only Name may differ.
-        widths.first() != Some(&self.widths[0])
+        // The table already shows what was dragged; only Name (displayed first) may differ.
+        widths.first() != Some(&self.widths[Col::Name.ix()])
     }
 
     fn refit(&mut self) -> bool {
         let Some(width) = self.fit_width else { return false };
-        let others: Pixels = self.widths[1..].iter().copied().sum();
+        let others: Pixels = self.visible.iter().filter(|&&c| c != Col::Name).map(|c| self.widths[c.ix()]).sum();
         // A pixel of slack so rounding never brings up a horizontal scrollbar.
         let name = (width - others - px(1.)).max(NAME_MIN_WIDTH).floor();
-        let changed = self.widths[0] != name;
-        self.widths[0] = name;
+        let changed = self.widths[Col::Name.ix()] != name;
+        self.widths[Col::Name.ix()] = name;
         changed
+    }
+
+    /// The column shown at `col_ix`. Falls back to Name rather than panicking
+    /// should the table ask about a column it hasn't been refreshed past.
+    fn col(&self, col_ix: usize) -> Col {
+        self.visible.get(col_ix).copied().unwrap_or(Col::Name)
+    }
+
+    pub fn is_shown(&self, col: Col) -> bool {
+        self.visible.contains(&col)
+    }
+
+    /// The hidden columns, for `prefs.json`.
+    pub fn hidden_columns(&self) -> Vec<Col> {
+        COLUMNS.into_iter().filter(|&c| !self.is_shown(c)).collect()
+    }
+
+    /// Hides exactly `hidden` (Name can't be). A sort on a column that ends up
+    /// hidden is cleared: there'd be no header showing it, or to undo it.
+    pub fn set_hidden_columns(&mut self, hidden: &[Col]) {
+        self.visible = COLUMNS.into_iter().filter(|c| *c == Col::Name || !hidden.contains(c)).collect();
+        if self.sort.is_some_and(|(c, _)| !self.is_shown(c)) {
+            self.set_sort(None);
+        }
+        self.refit();
+    }
+
+    /// Shows or hides `col` (Name stays). Returns whether anything changed
+    /// (the table then needs a `refresh`).
+    pub fn toggle_column(&mut self, col: Col) -> bool {
+        if col == Col::Name {
+            return false;
+        }
+        let mut hidden = self.hidden_columns();
+        match hidden.iter().position(|&c| c == col) {
+            Some(i) => _ = hidden.remove(i),
+            None => hidden.push(col),
+        }
+        self.set_hidden_columns(&hidden);
+        true
+    }
+
+    /// Shows every column at its default width. Returns whether anything changed.
+    pub fn reset_columns(&mut self) -> bool {
+        let changed = !self.columns_are_default();
+        self.visible = COLUMNS.to_vec();
+        self.widths = COLUMNS.map(Col::default_width);
+        self.refit();
+        changed
+    }
+
+    /// All columns shown at their default widths (Name's is fitted, so it doesn't count).
+    fn columns_are_default(&self) -> bool {
+        self.visible.len() == COLUMNS.len()
+            && COLUMNS.iter().all(|&c| c == Col::Name || self.widths[c.ix()] == c.default_width())
+    }
+
+    /// The header's right-click menu: a checkable entry per column, then a reset.
+    fn columns_menu(&self, menu: PopupMenu) -> PopupMenu {
+        let menu = match &self.action_context {
+            Some(h) => menu.action_context(h.clone()),
+            None => menu,
+        };
+        COLUMNS
+            .into_iter()
+            .fold(menu.min_w(px(200.)), |menu, col| {
+                let (shown, fixed) = (self.is_shown(col), col == Col::Name);
+                menu.menu_with_check_and_disabled(col.title(), shown, Box::new(ToggleColumn(col)), fixed)
+            })
+            .separator()
+            .menu_with_disabled("Reset columns", Box::new(ResetColumns), self.columns_are_default())
     }
 
     /// Moves the keyboard cursor (and the selection with it). Returns the row
@@ -445,7 +531,7 @@ impl TorrentTableDelegate {
 
 impl TableDelegate for TorrentTableDelegate {
     fn columns_count(&self, _: &App) -> usize {
-        COLUMNS.len()
+        self.visible.len()
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -453,11 +539,24 @@ impl TableDelegate for TorrentTableDelegate {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
-        COLUMNS[col_ix].column(self.widths[col_ix])
+        let col = self.col(col_ix);
+        col.column(self.widths[col.ix()])
     }
 
     fn render_header(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
         let theme = cx.theme();
+        // Right-clicking anywhere on the header (gaps and empty end included)
+        // opens the column menu. The table lays its header cells out after this
+        // child, over it; their hitboxes don't block it, and it stops the press
+        // before it reaches the table's own (row) context menu. The menu is built
+        // later, outside the table's update, so reading the table there is fine.
+        let table = cx.entity().downgrade();
+        let menu_area = div().id("header-menu").absolute().top_0().left_0().size_full().context_menu(
+            move |menu, _, cx| match table.upgrade() {
+                Some(table) => table.read(cx).delegate().columns_menu(menu),
+                None => menu,
+            },
+        );
         div()
             .id("header")
             .bg(theme.background)
@@ -466,10 +565,11 @@ impl TableDelegate for TorrentTableDelegate {
             .text_color(theme.muted_foreground)
             .border_b_1()
             .border_color(theme.border.opacity(0.6))
+            .child(menu_area)
     }
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
-        let col = COLUMNS[col_ix];
+        let col = self.col(col_ix);
         let active = self.sort.and_then(|(c, s)| (c == col && s != ColumnSort::Default).then_some(s));
         let theme = cx.theme();
         let fg = theme.foreground;
@@ -507,19 +607,17 @@ impl TableDelegate for TorrentTableDelegate {
             // No grid lines: rows are separated by spacing and hover/selection tints.
             .border_color(transparent_black())
             .when(selected, |d| d.bg(theme.primary.opacity(0.14)))
-            .on_click(cx.listener(move |table, ev: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |table, ev: &ClickEvent, _, cx| {
                 let m = ev.modifiers();
                 let toggle = m.secondary(cx);
                 let d = table.delegate_mut();
                 let order = d.order();
                 d.selection.click(&order, row_ix, toggle, m.shift);
-                // Double-click opens the download in the file manager.
-                if ev.click_count() == 2 && d.can_open_folder && !toggle && !m.shift {
-                    if let Some(h) = d.action_context.clone() {
-                        h.dispatch_action(&OpenFolder, window, cx);
-                    }
-                }
                 cx.emit(TableEvent::SelectRow(row_ix));
+                // The app opens the download's folder on a plain double-click.
+                if ev.click_count() == 2 && !toggle && !m.shift {
+                    cx.emit(TableEvent::DoubleClickedRow(row_ix));
+                }
                 cx.notify();
             }))
     }
@@ -565,9 +663,70 @@ impl TableDelegate for TorrentTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        // The table's cell is a plain block with top/bottom padding, so content
+        // would sit at the top of the row; center it vertically instead.
+        h_flex().size_full().items_center().child(self.render_cell_content(row_ix, col_ix, window, cx))
+    }
+
+    fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
+        let Some(t) = self.rows.get(row_ix) else { return String::new() };
+        match self.col(col_ix) {
+            Col::Name => display_name(t),
+            Col::Size => format::bytes(t.total_bytes),
+            Col::Progress => format::percent(t.progress()),
+            Col::Status => format::state(t.state).into(),
+            Col::Down => format::speed(t.down_bps),
+            Col::Up => format::speed(t.up_bps),
+            Col::Eta => format::eta(t.eta_secs),
+            Col::Peers => format!("{} / {}", t.peers_live, t.peers_seen),
+            Col::Ratio => format::ratio(t.ratio()),
+            Col::Added => format::date(t.added_at),
+        }
+    }
+
+    fn render_empty(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (icon, title, hint) = if self.all.is_empty() {
+            (
+                IconName::Inbox,
+                "Drop a .torrent or paste a magnet link",
+                "Ctrl+V adds a link from the clipboard · Ctrl+O opens .torrent files",
+            )
+        } else {
+            (IconName::Search, "Nothing matches", "No torrents match the current filter or search.")
+        };
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(52.))
+                    .mb_1()
+                    .rounded(px(14.))
+                    .bg(theme.muted.opacity(0.6))
+                    .child(Icon::new(icon).size(px(24.)).text_color(theme.muted_foreground)),
+            )
+            .child(div().text_base().font_weight(FontWeight::MEDIUM).text_color(theme.foreground).child(title))
+            .child(div().text_sm().text_color(theme.muted_foreground).child(hint))
+    }
+}
+
+impl TorrentTableDelegate {
+    fn render_cell_content(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> AnyElement {
         let Some(t) = self.rows.get(row_ix) else { return div().into_any_element() };
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -581,7 +740,7 @@ impl TableDelegate for TorrentTableDelegate {
                 .child(s)
                 .into_any_element()
         };
-        match COLUMNS[col_ix] {
+        match self.col(col_ix) {
             Col::Name => {
                 let (icon, color) = state_icon(t, cx);
                 h_flex()
@@ -663,53 +822,6 @@ impl TableDelegate for TorrentTableDelegate {
                 div().w_full().truncate().text_color(muted).child(format::short_date(t.added_at)).into_any_element()
             }
         }
-    }
-
-    fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
-        let Some(t) = self.rows.get(row_ix) else { return String::new() };
-        match COLUMNS[col_ix] {
-            Col::Name => display_name(t),
-            Col::Size => format::bytes(t.total_bytes),
-            Col::Progress => format::percent(t.progress()),
-            Col::Status => format::state(t.state).into(),
-            Col::Down => format::speed(t.down_bps),
-            Col::Up => format::speed(t.up_bps),
-            Col::Eta => format::eta(t.eta_secs),
-            Col::Peers => format!("{} / {}", t.peers_live, t.peers_seen),
-            Col::Ratio => format::ratio(t.ratio()),
-            Col::Added => format::date(t.added_at),
-        }
-    }
-
-    fn render_empty(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (icon, title, hint) = if self.all.is_empty() {
-            (
-                IconName::Inbox,
-                "Drop a .torrent or paste a magnet link",
-                "Ctrl+V adds a link from the clipboard · Ctrl+O opens .torrent files",
-            )
-        } else {
-            (IconName::Search, "Nothing matches", "No torrents match the current filter or search.")
-        };
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(52.))
-                    .mb_1()
-                    .rounded(px(14.))
-                    .bg(theme.muted.opacity(0.6))
-                    .child(Icon::new(icon).size(px(24.)).text_color(theme.muted_foreground)),
-            )
-            .child(div().text_base().font_weight(FontWeight::MEDIUM).text_color(theme.foreground).child(title))
-            .child(div().text_sm().text_color(theme.muted_foreground).child(hint))
     }
 }
 
@@ -868,8 +980,79 @@ mod tests {
     fn column_keys_round_trip() {
         for c in COLUMNS {
             assert_eq!(Col::from_key(c.key()), Some(c));
+            assert_eq!(COLUMNS[c.ix()], c);
         }
         assert_eq!(Col::from_key("nope"), None);
+    }
+
+    #[test]
+    fn hiding_columns_maps_displayed_indices() {
+        let mut d = TorrentTableDelegate::new();
+        assert!(d.toggle_column(Col::Size));
+        assert!(d.toggle_column(Col::Eta));
+        assert_eq!(d.hidden_columns(), vec![Col::Size, Col::Eta]);
+        assert_eq!(d.visible.len(), COLUMNS.len() - 2);
+        assert_eq!((d.col(0), d.col(1), d.col(5)), (Col::Name, Col::Progress, Col::Peers));
+        // Showing again puts it back in its place, not at the end.
+        assert!(d.toggle_column(Col::Size));
+        assert_eq!(d.col(1), Col::Size);
+        // Name can't be hidden; it's always first.
+        assert!(!d.toggle_column(Col::Name));
+        d.set_hidden_columns(&[Col::Name, Col::Up]);
+        assert_eq!(d.hidden_columns(), vec![Col::Up]);
+        assert_eq!(d.col(0), Col::Name);
+        assert!(d.reset_columns());
+        assert!(d.hidden_columns().is_empty());
+        assert!(!d.reset_columns());
+    }
+
+    #[test]
+    fn hiding_the_sorted_column_clears_the_sort() {
+        let mut d = TorrentTableDelegate::new();
+        d.set_sort(Some((Col::Size, ColumnSort::Descending)));
+        d.toggle_column(Col::Eta);
+        assert_eq!(d.sort(), Some((Col::Size, ColumnSort::Descending)));
+        d.toggle_column(Col::Size);
+        assert_eq!(d.sort(), None);
+        // Also when restoring a saved sort on a column that's saved as hidden.
+        d.set_sort(Some((Col::Size, ColumnSort::Ascending)));
+        d.set_hidden_columns(&d.hidden_columns());
+        assert_eq!(d.sort(), None);
+    }
+
+    #[test]
+    fn name_fills_the_rest_with_hidden_columns_and_widths_survive() {
+        let mut d = TorrentTableDelegate::new();
+        let others: Pixels = COLUMNS[1..].iter().map(|c| c.default_width()).sum();
+        d.fit_name(others + px(500.));
+        assert_eq!(d.widths[0], px(499.));
+        // Hiding a column gives its width to Name, showing it takes it back.
+        d.toggle_column(Col::Progress);
+        assert_eq!(d.widths[0], px(499.) + Col::Progress.default_width());
+        d.toggle_column(Col::Progress);
+        assert_eq!(d.widths[0], px(499.));
+
+        // Drag Status (displayed at 2 with Progress hidden) wider; widths come in displayed order.
+        d.toggle_column(Col::Progress);
+        let mut dragged: Vec<Pixels> = d.visible.iter().map(|c| d.widths[c.ix()]).collect();
+        assert_eq!(d.col(2), Col::Status);
+        dragged[2] += px(40.);
+        assert!(d.set_widths(&dragged));
+        assert_eq!(d.widths[Col::Status.ix()], Col::Status.default_width() + px(40.));
+        assert_eq!(d.widths[Col::Progress.ix()], Col::Progress.default_width());
+        assert_eq!(d.widths[0], px(499.) + Col::Progress.default_width() - px(40.));
+        // Widths from before the columns changed are ignored.
+        assert!(!d.set_widths(&COLUMNS.map(Col::default_width)));
+        assert_eq!(d.widths[Col::Status.ix()], Col::Status.default_width() + px(40.));
+
+        // Shown again, Progress has its old width and Status keeps its dragged one.
+        d.toggle_column(Col::Progress);
+        assert_eq!(d.widths[Col::Progress.ix()], Col::Progress.default_width());
+        assert_eq!(d.widths[0], px(459.));
+        // Reset puts the default widths back.
+        assert!(d.reset_columns());
+        assert_eq!(d.widths[Col::Status.ix()], Col::Status.default_width());
+        assert_eq!(d.widths[0], px(499.));
     }
 
     #[test]
