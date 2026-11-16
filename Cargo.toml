@@ -1,6 +1,14 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Vendored, patched dependencies: built as path deps, not workspace members
+# (so `cargo test --workspace` / clippy / fmt leave them alone).
+exclude = ["vendor"]
+
+# librqbit 9.1.0 plus a configurable piece picker (rarest-first vs sequential,
+# per-file priorities). See vendor/librqbit/STORM_PATCHES.md.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
 
 [workspace.package]
 version = "0.1.2"
