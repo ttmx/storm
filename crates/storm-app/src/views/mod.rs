@@ -6,5 +6,6 @@ pub mod dialogs;
 pub mod file_tree;
 pub mod folder_picker;
 pub mod local_copy;
+pub mod piece_map;
 pub mod status_bar;
 pub mod torrent_table;

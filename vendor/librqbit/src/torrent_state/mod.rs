@@ -28,6 +28,8 @@ use librqbit_core::torrent_metainfo::ValidatedTorrentMetaV1Info;
 pub use live::*;
 use parking_lot::RwLock;
 
+use crate::piece_picking::PickerSettings;
+
 use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
@@ -195,6 +197,10 @@ pub struct ManagedTorrentShared {
     pub(crate) magnet_name: Option<String>,
 
     pub(crate) client_name_and_version: String,
+
+    // [Storm patch] Piece picking settings; see piece_picking. Read when a live
+    // state is created and on set_picker_settings.
+    pub(crate) picker: parking_lot::RwLock<PickerSettings>,
 }
 
 impl ManagedTorrentShared {
@@ -275,6 +281,13 @@ impl ManagedTorrent {
                 .context("error getting chunks")?)),
             _ => bail!("no chunk tracker, torrent neither paused nor live"),
         }
+    }
+
+    /// [Storm patch] The pieces we have (downloaded and verified), as a
+    /// most-significant-bit-first bitfield. `None` while initializing or in error.
+    pub fn have_pieces(&self) -> Option<Vec<u8>> {
+        self.with_chunk_tracker(|c| c.get_have_pieces().as_bytes().to_vec())
+            .ok()
     }
 
     /// Get the live state if the torrent is live.
@@ -611,6 +624,33 @@ impl ManagedTorrent {
             Ok(())
         }
         .boxed()
+    }
+
+    /// [Storm patch] The torrent's piece picking settings.
+    pub fn picker_settings(&self) -> PickerSettings {
+        self.shared.picker.read().clone()
+    }
+
+    /// [Storm patch] Changes how pieces are picked (see `piece_picking`). Takes
+    /// effect immediately on a live torrent, and survives pause/resume (but not a
+    /// session restart: the caller persists it).
+    pub fn set_picker_settings(&self, settings: PickerSettings) -> anyhow::Result<()> {
+        if let Some(m) = &*self.metadata.load() {
+            let n = m.file_infos.len();
+            if settings.file_priorities.len() > n {
+                bail!("{} file priorities given, torrent has {n} files", settings.file_priorities.len());
+            }
+        }
+        *self.shared.picker.write() = settings;
+        // Clone the live state out, so its lock isn't taken under ours.
+        let live = match &self.locked.read().state {
+            ManagedTorrentState::Live(l) => Some(l.clone()),
+            _ => None,
+        };
+        if let Some(live) = live {
+            live.refresh_picker();
+        }
+        Ok(())
     }
 
     // Returns true if needed to unpause torrent.

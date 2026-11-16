@@ -3,18 +3,19 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use storm_proto::{TorrentId, TorrentState, TorrentSummary};
 
 use crate::app::{
     CopyInfoHash, CopyMagnet, OpenFolder, PauseSelected, RemoveSelected, RemoveSelectedWithData, ResetColumns,
-    ResumeSelected, ToggleColumn,
+    ResumeSelected, SetSequential, ToggleColumn,
 };
 use crate::format;
 use crate::state::{Filter, matches_query};
@@ -440,19 +441,68 @@ impl TorrentTableDelegate {
     }
 
     /// The header's right-click menu: a checkable entry per column, then a reset.
-    fn columns_menu(&self, menu: PopupMenu) -> PopupMenu {
+    /// The header's column menu. Ticking a column keeps the menu open, so several
+    /// can be changed in one go; clicking elsewhere (or Escape) closes it.
+    fn columns_menu(&self, menu: PopupMenu, table: WeakEntity<TableState<Self>>) -> PopupMenu {
         let menu = match &self.action_context {
             Some(h) => menu.action_context(h.clone()),
             None => menu,
         };
+        let focus = self.action_context.clone();
+        // Drawn like a regular checked item (check slot, gap, label), but read live,
+        // so the checks follow the clicks while the menu stays up.
+        // (No item may carry a static check or icon: the menu would then reserve its
+        // own icon column in front of ours.)
+        let row = move |label: SharedString, checked: Box<dyn Fn(&App) -> bool>, action: Option<Box<dyn Action>>| {
+            let (focus, action) = (focus.clone(), action.map(Rc::<dyn Action>::from));
+            let disabled = action.is_none();
+            PopupMenuItem::element(move |_, cx| {
+                let (focus, action) = (focus.clone(), action.clone());
+                h_flex()
+                    .flex_1()
+                    .self_stretch()
+                    // Cover the item's padding too, so no click reaches the menu's own handler.
+                    .mx(-rems(0.5))
+                    .px(rems(0.5))
+                    .gap_x_1()
+                    .child(if checked(cx) { Icon::new(IconName::Check) } else { Icon::empty() }.xsmall())
+                    .child(label.clone())
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        // Stops the menu from seeing the click, which would close it.
+                        cx.stop_propagation();
+                        if let (Some(focus), Some(action)) = (&focus, &action) {
+                            // Dispatching moves focus to the app; give it back to the
+                            // menu so Escape still closes it.
+                            let menu_focus = window.focused(cx);
+                            focus.dispatch_action(&**action, window, cx);
+                            if let Some(f) = menu_focus {
+                                f.focus(window, cx);
+                            }
+                            window.refresh();
+                        }
+                    })
+            })
+            .disabled(disabled)
+        };
+        let shown = |col: Col| {
+            let table = table.clone();
+            Box::new(move |cx: &App| table.upgrade().is_some_and(|t| t.read(cx).delegate().is_shown(col)))
+                as Box<dyn Fn(&App) -> bool>
+        };
         COLUMNS
             .into_iter()
             .fold(menu.min_w(px(200.)), |menu, col| {
-                let (shown, fixed) = (self.is_shown(col), col == Col::Name);
-                menu.menu_with_check_and_disabled(col.title(), shown, Box::new(ToggleColumn(col)), fixed)
+                // Name is always shown.
+                let action = (col != Col::Name).then(|| Box::new(ToggleColumn(col)) as Box<dyn Action>);
+                menu.item(row(col.title().into(), shown(col), action))
             })
             .separator()
-            .menu_with_disabled("Reset columns", Box::new(ResetColumns), self.columns_are_default())
+            // A normal menu action, so it closes the menu; drawn like the rows above so
+            // its label lines up with theirs.
+            .item(
+                PopupMenuItem::element(|_, _| h_flex().gap_x_1().child(Icon::empty().xsmall()).child("Reset columns"))
+                    .action(Box::new(ResetColumns)),
+            )
     }
 
     /// Moves the keyboard cursor (and the selection with it). Returns the row
@@ -553,7 +603,7 @@ impl TableDelegate for TorrentTableDelegate {
         let table = cx.entity().downgrade();
         let menu_area = div().id("header-menu").absolute().top_0().left_0().size_full().context_menu(
             move |menu, _, cx| match table.upgrade() {
-                Some(table) => table.read(cx).delegate().columns_menu(menu),
+                Some(t) => t.read(cx).delegate().columns_menu(menu, table.clone()),
                 None => menu,
             },
         );
@@ -626,7 +676,7 @@ impl TableDelegate for TorrentTableDelegate {
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let Some(id) = self.rows.get(row_ix).map(|t| t.id) else { return menu };
@@ -641,6 +691,22 @@ impl TableDelegate for TorrentTableDelegate {
         let can_pause = states.iter().any(|s| !matches!(s, TorrentState::Paused | TorrentState::FetchingMetadata));
         let can_resume = states.iter().any(|s| matches!(s, TorrentState::Paused | TorrentState::Error));
         let single = states.len() == 1;
+        let selected: Vec<&TorrentSummary> = self.rows.iter().filter(|t| self.selection.ids.contains(&t.id)).collect();
+        // A check only where the whole selection agrees.
+        let all_sequential = !selected.is_empty() && selected.iter().all(|t| t.sequential);
+        let all_rarest = !selected.is_empty() && selected.iter().all(|t| !t.sequential);
+        let context = self.action_context.clone();
+        let order = PopupMenu::build(window, cx, move |m, _, _| {
+            let m = match &context {
+                Some(h) => m.action_context(h.clone()),
+                None => m,
+            };
+            m.menu_with_check("Rarest first", all_rarest, Box::new(SetSequential(false))).menu_with_check(
+                "Sequential",
+                all_sequential,
+                Box::new(SetSequential(true)),
+            )
+        });
         let menu = match &self.action_context {
             Some(h) => menu.action_context(h.clone()),
             None => menu,
@@ -648,6 +714,8 @@ impl TableDelegate for TorrentTableDelegate {
         menu.min_w(px(200.))
             .menu_with_icon_and_disabled("Resume", IconName::Play, Box::new(ResumeSelected), !can_resume)
             .menu_with_icon_and_disabled("Pause", IconName::Pause, Box::new(PauseSelected), !can_pause)
+            .separator()
+            .item(PopupMenuItem::submenu("Download order", order))
             .separator()
             .when(self.can_open_folder, |m| {
                 m.menu_with_icon_and_disabled("Open folder", IconName::FolderOpen, Box::new(OpenFolder), !single)
@@ -852,6 +920,7 @@ mod tests {
             output_folder: String::new(),
             added_at: Some(id as i64),
             completed_at: None,
+            sequential: false,
         }
     }
 

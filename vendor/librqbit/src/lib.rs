@@ -63,6 +63,7 @@ mod listen;
 mod merge_streams;
 mod peer_connection;
 mod peer_info_reader;
+pub mod piece_picking;
 mod piece_tracker;
 mod read_buf;
 mod session;
@@ -101,6 +102,7 @@ pub use torrent_state::{
     TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
+pub use piece_picking::{FilePriority, PickerSettings, PiecePicking};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

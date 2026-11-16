@@ -102,6 +102,7 @@ pub struct AddTorrentDialog {
     save_to: Option<String>,
     default_dir: Option<String>,
     paused: bool,
+    sequential: bool,
     busy: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -149,7 +150,16 @@ impl AddTorrentDialog {
     }
 
     fn new(source: AddSource, default_dir: Option<String>, subs: Vec<Subscription>) -> Self {
-        Self { source, save_to: None, default_dir, paused: false, busy: false, error: None, _subscriptions: subs }
+        Self {
+            source,
+            save_to: None,
+            default_dir,
+            paused: false,
+            sequential: false,
+            busy: false,
+            error: None,
+            _subscriptions: subs,
+        }
     }
 
     fn show(dialog: Entity<Self>, header: Header, window: &mut Window, cx: &mut App) {
@@ -185,6 +195,7 @@ impl AddTorrentDialog {
         for (_, r) in &mut reqs {
             r.output_folder = self.save_to.clone();
             r.paused = self.paused;
+            r.sequential = self.sequential;
         }
         Ok(reqs)
     }
@@ -301,6 +312,14 @@ impl Render for AddTorrentDialog {
                 cx.notify();
             },
         ));
+        let sequential = Checkbox::new("sequential")
+            .label("Download sequentially")
+            .tooltip("Fetch pieces in order, file by file, so media can be previewed while downloading. Slower and less helpful to other peers than the default (rarest first).")
+            .checked(self.sequential)
+            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                this.sequential = *v;
+                cx.notify();
+            }));
         v_flex()
             .pt_2()
             .gap(px(ui::space::ROW))
@@ -315,7 +334,7 @@ impl Render for AddTorrentDialog {
             .child(
                 Footer::new("Add")
                     .busy(self.busy)
-                    .leading(paused)
+                    .leading(h_flex().gap_4().child(paused).child(sequential))
                     .render(cx.listener(|this, _, w, cx| this.submit(w, cx))),
             )
     }

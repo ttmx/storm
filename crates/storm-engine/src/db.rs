@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
-use storm_proto::{Settings, StatsSample};
+use storm_proto::{FilePriority, Settings, StatsSample};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS counters (
     name TEXT PRIMARY KEY,
     base INTEGER NOT NULL,
     last INTEGER NOT NULL
+);
+-- Piece picking per torrent; a missing row means rarest-first, all files normal.
+CREATE TABLE IF NOT EXISTS picking (
+    info_hash       TEXT PRIMARY KEY,
+    sequential      INTEGER NOT NULL DEFAULT 0,
+    file_priorities TEXT NOT NULL DEFAULT '[]'  -- JSON array of FilePriority, by file index
 );
 CREATE TABLE IF NOT EXISTS stats_samples (
     ts       INTEGER PRIMARY KEY,  -- unix seconds
@@ -63,6 +69,20 @@ impl Counter {
 
     pub fn total(&self) -> u64 {
         self.base + self.last
+    }
+}
+
+/// How a torrent's pieces are picked (see librqbit's `piece_picking`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Picking {
+    pub sequential: bool,
+    /// By file index; missing entries are `Normal`.
+    pub file_priorities: Vec<FilePriority>,
+}
+
+impl Picking {
+    pub fn is_default(&self) -> bool {
+        !self.sequential && self.file_priorities.iter().all(|p| *p == FilePriority::Normal)
     }
 }
 
@@ -196,7 +216,40 @@ impl Db {
     }
 
     pub fn delete_torrent(&self, info_hash: &str) -> anyhow::Result<()> {
-        self.conn().execute("DELETE FROM torrents WHERE info_hash = ?1", [info_hash])?;
+        let conn = self.conn();
+        conn.execute("DELETE FROM torrents WHERE info_hash = ?1", [info_hash])?;
+        conn.execute("DELETE FROM picking WHERE info_hash = ?1", [info_hash])?;
+        Ok(())
+    }
+
+    // --- piece picking ------------------------------------------------------
+
+    pub fn load_picking(&self) -> anyhow::Result<HashMap<String, Picking>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT info_hash, sequential, file_priorities FROM picking")?;
+        let rows = stmt.query_map([], |r| {
+            let prios: String = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                Picking { sequential: r.get(1)?, file_priorities: serde_json::from_str(&prios).unwrap_or_default() },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Stores `p`, or forgets the row when `p` is the default.
+    pub fn save_picking(&self, info_hash: &str, p: &Picking) -> anyhow::Result<()> {
+        let conn = self.conn();
+        if p.is_default() {
+            conn.execute("DELETE FROM picking WHERE info_hash = ?1", [info_hash])?;
+        } else {
+            conn.execute(
+                "INSERT INTO picking (info_hash, sequential, file_priorities) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(info_hash) DO UPDATE SET
+                    sequential = excluded.sequential, file_priorities = excluded.file_priorities",
+                params![info_hash, p.sequential, serde_json::to_string(&p.file_priorities)?],
+            )?;
+        }
         Ok(())
     }
 
@@ -275,6 +328,20 @@ mod tests {
         let changed = Settings { up_limit_bps: Some(5000), ..defaults.clone() };
         db.save_settings(&changed).unwrap();
         assert_eq!(db.load_settings(defaults).unwrap(), changed);
+    }
+
+    #[test]
+    fn picking_roundtrips_and_default_is_not_stored() {
+        let db = Db::open_in_memory().unwrap();
+        let p = Picking { sequential: true, file_priorities: vec![FilePriority::High, FilePriority::Low] };
+        db.save_picking("aa", &p).unwrap();
+        db.save_picking("bb", &Picking { sequential: true, ..Default::default() }).unwrap();
+        db.save_picking("bb", &Picking::default()).unwrap();
+        let loaded = db.load_picking().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["aa"], p);
+        db.delete_torrent("aa").unwrap();
+        assert!(db.load_picking().unwrap().is_empty());
     }
 
     #[test]

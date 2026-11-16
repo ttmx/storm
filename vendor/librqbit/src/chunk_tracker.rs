@@ -9,6 +9,7 @@ use tracing::{debug, trace};
 use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
+    piece_picking::{PiecePicking, rarity_key, tiebreak_offset},
     type_aliases::{BF, BS, FileInfos, FilePriorities},
 };
 
@@ -233,19 +234,68 @@ impl ChunkTracker {
         hns
     }
 
-    pub(crate) fn iter_queued_pieces<'a>(
+    /// Unfinished files among `files`, with their ids.
+    fn unfinished_files<'a>(
         &'a self,
-        file_priorities: &'a FilePriorities,
+        files: impl Iterator<Item = &'a usize> + 'a,
         file_infos: &'a FileInfos,
-    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        file_priorities
-            .iter()
-            .filter_map(|p| Some((*p, file_infos.get(*p)?)))
+    ) -> impl Iterator<Item = &'a FileInfo> + 'a {
+        files
+            .filter_map(move |p| Some((*p, file_infos.get(*p)?)))
             .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
-            .flat_map(|(_id, f)| f.iter_piece_priorities())
-            .filter(|id| self.queue_pieces[*id])
-            .filter_map(|id| id.try_into().ok())
-            .filter_map(|id| self.lengths.validate_piece_index(id))
+            .map(|(_, f)| f)
+    }
+
+    fn validate_queued(&self, id: usize) -> Option<ValidPieceIndex> {
+        if !self.queue_pieces.get(id).is_some_and(|b| *b) {
+            return None;
+        }
+        self.lengths.validate_piece_index(id.try_into().ok()?)
+    }
+
+    /// [Storm patch] Picks the next queued piece for a peer that has the pieces
+    /// `peer_has` says, following `file_priorities` (see `piece_picking`).
+    /// `availability` gives, per piece index, how many live peers have it; it's
+    /// only consulted in rarest-first mode.
+    pub(crate) fn pick_queued_piece(
+        &self,
+        file_priorities: &FilePriorities,
+        file_infos: &FileInfos,
+        availability: impl Fn(usize) -> u32,
+        peer_has: impl Fn(ValidPieceIndex) -> bool,
+    ) -> Option<ValidPieceIndex> {
+        match file_priorities.mode() {
+            PiecePicking::Sequential => self
+                .unfinished_files(file_priorities.iter(), file_infos)
+                .flat_map(|f| f.iter_piece_priorities())
+                .filter_map(|id| self.validate_queued(id))
+                .find(|p| peer_has(*p)),
+            PiecePicking::RarestFirst => {
+                let total = self.lengths.total_pieces();
+                let offset = tiebreak_offset(total);
+                for tier in file_priorities.tiers() {
+                    let mut best: Option<((u32, u32), ValidPieceIndex)> = None;
+                    for f in self.unfinished_files(tier.iter(), file_infos) {
+                        for id in f.piece_range_usize() {
+                            let Some(piece) = self.validate_queued(id) else {
+                                continue;
+                            };
+                            if !peer_has(piece) {
+                                continue;
+                            }
+                            let key = rarity_key(availability(id), piece, offset, total);
+                            if best.is_none_or(|(k, _)| key < k) {
+                                best = Some((key, piece));
+                            }
+                        }
+                    }
+                    if let Some((_, piece)) = best {
+                        return Some(piece);
+                    }
+                }
+                None
+            }
+        }
     }
 
     pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {

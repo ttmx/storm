@@ -94,6 +94,9 @@ pub struct TorrentSummary {
     pub added_at: Option<i64>,
     /// Unix seconds.
     pub completed_at: Option<i64>,
+    /// Pieces are fetched in order (file by file) instead of rarest-first.
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 impl TorrentSummary {
@@ -115,6 +118,34 @@ pub struct TorrentFile {
     pub length: u64,
     pub progress_bytes: u64,
     pub included: bool,
+    #[serde(default)]
+    pub priority: FilePriority,
+    /// Where the file starts within the torrent's data, in bytes.
+    #[serde(default)]
+    pub offset: u64,
+}
+
+/// Download priority of a file. Files of a higher priority are fetched first;
+/// files that aren't wanted at all are excluded (`TorrentFile::included`) instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl FilePriority {
+    pub const ALL: [FilePriority; 3] = [FilePriority::High, FilePriority::Normal, FilePriority::Low];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FilePriority::Low => "Low",
+            FilePriority::Normal => "Normal",
+            FilePriority::High => "High",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +162,35 @@ pub struct TorrentDetails {
     /// The metainfo's `creation date`, unix seconds.
     #[serde(default)]
     pub creation_date: Option<i64>,
+    /// Which pieces are downloaded and verified. `None` until known.
+    #[serde(default)]
+    pub have_pieces: Option<PieceMap>,
+}
+
+/// One bit per piece, most significant bit first (BitTorrent's bitfield layout).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PieceMap(#[serde(with = "base64_bytes")] pub Vec<u8>);
+
+impl PieceMap {
+    pub fn from_bools(bits: impl IntoIterator<Item = bool>) -> Self {
+        let mut bytes = Vec::new();
+        for (i, b) in bits.into_iter().enumerate() {
+            if i % 8 == 0 {
+                bytes.push(0);
+            }
+            if b {
+                *bytes.last_mut().unwrap() |= 0x80 >> (i % 8);
+            }
+        }
+        PieceMap(bytes)
+    }
+
+    /// Whether piece `i` is downloaded (`false` when out of range).
+    pub fn has(&self, i: u32) -> bool {
+        let i = i as usize;
+        self.0.get(i / 8).is_some_and(|b| b & (0x80 >> (i % 8)) != 0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,15 +240,22 @@ pub struct AddTorrentRequest {
     /// Only download these file indices.
     #[serde(default)]
     pub only_files: Option<Vec<usize>>,
+    /// Download pieces in order instead of rarest-first.
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 impl AddTorrentRequest {
     pub fn url(url: impl Into<String>) -> Self {
-        Self { source: TorrentSource::Url { url: url.into() }, output_folder: None, paused: false, only_files: None }
+        Self::new(TorrentSource::Url { url: url.into() })
     }
 
     pub fn file(bytes: Vec<u8>) -> Self {
-        Self { source: TorrentSource::File { bytes }, output_folder: None, paused: false, only_files: None }
+        Self::new(TorrentSource::File { bytes })
+    }
+
+    fn new(source: TorrentSource) -> Self {
+        Self { source, output_folder: None, paused: false, only_files: None, sequential: false }
     }
 }
 
@@ -356,6 +423,10 @@ pub trait Backend: Send + Sync + 'static {
     async fn resume(&self, id: TorrentId) -> Result<()>;
     async fn remove(&self, id: TorrentId, delete_files: bool) -> Result<()>;
     async fn set_included_files(&self, id: TorrentId, files: Vec<usize>) -> Result<()>;
+    /// Sequential (in order, file by file) vs rarest-first piece picking.
+    async fn set_sequential(&self, id: TorrentId, sequential: bool) -> Result<()>;
+    /// Sets the download priority of the given files.
+    async fn set_file_priority(&self, id: TorrentId, files: Vec<usize>, priority: FilePriority) -> Result<()>;
 
     async fn session_stats(&self) -> Result<SessionStats>;
     /// Samples newer than `since` (unix seconds), oldest first.
@@ -426,12 +497,32 @@ mod tests {
     }
 
     #[test]
+    fn piece_map_is_msb_first_and_base64_on_the_wire() {
+        let m = PieceMap::from_bools([true, false, false, false, false, false, false, true, true]);
+        assert_eq!(m.0, [0b1000_0001, 0b1000_0000]);
+        assert!(m.has(0) && !m.has(1) && m.has(7) && m.has(8) && !m.has(9) && !m.has(100));
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"gYA=\"");
+        assert_eq!(serde_json::from_str::<PieceMap>(&json).unwrap(), m);
+    }
+
+    #[test]
     fn torrent_file_roundtrips_as_base64() {
         let req = AddTorrentRequest::file(vec![1, 2, 3]);
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("AQID"));
         let back: AddTorrentRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.source, TorrentSource::File { bytes } if bytes == vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn older_payloads_default_to_rarest_first_and_normal_priority() {
+        let f: TorrentFile =
+            serde_json::from_str(r#"{"index":0,"path":"a","length":1,"progress_bytes":0,"included":true}"#).unwrap();
+        assert_eq!(f.priority, FilePriority::Normal);
+        let r: AddTorrentRequest = serde_json::from_str(r#"{"source":{"type":"url","url":"magnet:?"}}"#).unwrap();
+        assert!(!r.sequential);
+        assert_eq!(serde_json::to_string(&FilePriority::High).unwrap(), r#""high""#);
     }
 
     #[test]

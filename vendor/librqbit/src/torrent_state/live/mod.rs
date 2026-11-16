@@ -91,6 +91,7 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
+    piece_picking::PieceAvailability,
     piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
@@ -243,19 +244,9 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
 
-        // TODO: make it configurable
-        let file_priorities = {
-            let mut pri = (0..paused.metadata.file_infos.len()).collect::<Vec<usize>>();
-            // sort by filename, cause many torrents have random sort order.
-            pri.sort_unstable_by_key(|id| {
-                paused
-                    .metadata
-                    .file_infos
-                    .get(*id)
-                    .map(|fi| fi.relative_filename.as_path())
-            });
-            pri
-        };
+        // [Storm patch] Configurable: see piece_picking.
+        let file_priorities =
+            FilePriorities::new(&paused.shared.picker.read(), &paused.metadata.file_infos);
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
@@ -273,6 +264,7 @@ impl TorrentStateLive {
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
+                availability: PieceAvailability::new(&lengths),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
@@ -807,6 +799,12 @@ impl TorrentStateLive {
             warn!(id=self.shared.id, info_hash=?self.shared.info_hash, "there's nowhere to send fatal error, receiver is dead");
         }
         Err(res)
+    }
+
+    /// [Storm patch] Recompiles the piece picker after `shared.picker` changed.
+    pub(crate) fn refresh_picker(&self) {
+        let fp = FilePriorities::new(&self.shared.picker.read(), &self.metadata.file_infos);
+        self.lock_write("refresh_picker").file_priorities = fp;
     }
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
@@ -1452,6 +1450,7 @@ impl PeerHandler {
                     priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
+                    piece_availability: Some(&self.state.peers.availability),
                     peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
                     can_steal: |p| {
                         self.state.per_piece_locks[p.get_usize()]
@@ -1542,7 +1541,12 @@ impl PeerHandler {
                     live.bitfield = make_piece_bitfield(&self.state.lengths);
                 }
                 match live.bitfield.get_mut(have as usize) {
-                    Some(mut v) => *v = true,
+                    Some(mut v) => {
+                        if !*v {
+                            self.state.peers.availability.inc(have as usize);
+                        }
+                        *v = true
+                    }
                     None => {
                         warn!(
                             id = self.state.shared.id,

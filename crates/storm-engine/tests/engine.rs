@@ -59,6 +59,8 @@ async fn add_seed_inspect_remove() {
     assert_eq!(details.files[0].path, "hello.bin");
     assert!(details.files[0].included);
     assert!(details.piece_count.unwrap() > 0);
+    let have = details.have_pieces.expect("a seeding torrent knows its pieces");
+    assert!((0..details.piece_count.unwrap()).all(|i| have.has(i)), "seeding means every piece is there");
 
     let mut events = backend.subscribe().await.unwrap();
     match events.next().await.unwrap() {
@@ -241,5 +243,84 @@ async fn details_without_comment_are_none() {
     let added = backend.add_torrent(req).await.unwrap();
     let d = backend.torrent_details(added.id).await.unwrap();
     assert_eq!((d.comment, d.created_by, d.creation_date), (None, None, None));
+    backend.shutdown().await;
+}
+
+/// Sequential mode and file priorities apply right away, show up in the summary and
+/// details, and survive a restart (storm keeps them; librqbit doesn't persist them).
+#[tokio::test(flavor = "multi_thread")]
+async fn piece_picking_settings_apply_and_persist() {
+    use storm_proto::FilePriority;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let content = tmp.path().join("seed").join("show");
+    std::fs::create_dir_all(&content).unwrap();
+    std::fs::write(content.join("e01.mkv"), vec![1u8; 200_000]).unwrap();
+    std::fs::write(content.join("e02.mkv"), vec![2u8; 200_000]).unwrap();
+    let torrent = librqbit::create_torrent(
+        &content,
+        librqbit::CreateTorrentOptions { name: None, trackers: vec![], piece_length: None },
+        &librqbit::spawn_utils::BlockingSpawner::new(1),
+    )
+    .await
+    .unwrap()
+    .as_bytes()
+    .unwrap()
+    .to_vec();
+
+    let backend = start(tmp.path()).await;
+    let mut req = AddTorrentRequest::file(torrent);
+    req.sequential = true;
+    req.paused = true;
+    let id = backend.add_torrent(req).await.unwrap().id;
+    assert!(backend.list_torrents().await.unwrap()[0].sequential, "requested at add time");
+
+    let files = backend.torrent_details(id).await.unwrap().files;
+    assert!(files.iter().all(|f| f.priority == FilePriority::Normal));
+    let e02 = files.iter().find(|f| f.path.ends_with("e02.mkv")).unwrap().index;
+    backend.set_file_priority(id, vec![e02], FilePriority::High).await.unwrap();
+    assert!(backend.set_file_priority(id, vec![99], FilePriority::Low).await.is_err(), "bad index");
+    backend.set_sequential(id, false).await.unwrap();
+    backend.set_sequential(id, true).await.unwrap();
+
+    let check = |d: storm_proto::TorrentDetails| {
+        assert!(d.summary.sequential);
+        for f in d.files {
+            let want = if f.index == e02 { FilePriority::High } else { FilePriority::Normal };
+            assert_eq!(f.priority, want, "{}", f.path);
+        }
+    };
+    check(backend.torrent_details(id).await.unwrap());
+    backend.shutdown().await;
+    drop(backend);
+
+    let backend = start(tmp.path()).await;
+    let id = backend.list_torrents().await.unwrap()[0].id;
+    check(backend.torrent_details(id).await.unwrap());
+
+    // Back to the defaults: the stored row goes away, and that sticks too.
+    backend.set_sequential(id, false).await.unwrap();
+    backend.set_file_priority(id, vec![e02], FilePriority::Normal).await.unwrap();
+    backend.shutdown().await;
+    drop(backend);
+    let backend = start(tmp.path()).await;
+    let d = backend.torrent_details(backend.list_torrents().await.unwrap()[0].id).await.unwrap();
+    assert!(!d.summary.sequential);
+    assert!(d.files.iter().all(|f| f.priority == FilePriority::Normal));
+    backend.shutdown().await;
+}
+
+/// Sequential can be toggled while a magnet is still fetching metadata.
+#[tokio::test(flavor = "multi_thread")]
+async fn sequential_toggles_on_pending_magnets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = start(tmp.path()).await;
+    let magnet = "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef&dn=Later";
+    let id = backend.add_torrent(AddTorrentRequest::url(magnet)).await.unwrap().id;
+    assert!(!backend.list_torrents().await.unwrap()[0].sequential);
+    backend.set_sequential(id, true).await.unwrap();
+    assert!(backend.list_torrents().await.unwrap()[0].sequential);
+    assert!(backend.set_file_priority(id, vec![0], storm_proto::FilePriority::High).await.is_err(), "no file list yet");
+    backend.remove(id, false).await.unwrap();
     backend.shutdown().await;
 }

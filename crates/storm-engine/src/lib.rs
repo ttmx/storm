@@ -20,19 +20,19 @@ use anyhow::Context;
 use futures::StreamExt;
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ListenerMode, ListenerOptions, ManagedTorrent, Session,
-    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ListenerMode, ListenerOptions, ManagedTorrent,
+    PickerSettings, PiecePicking, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
 use storm_proto::{
     self as proto, AddTorrentRequest, Backend, BackendInfo, BackendKind, DirListing, Error, Event, EventStream,
-    PeerInfo, SessionStats, Settings, SettingsPatch, StatsSample, TorrentDetails, TorrentFile, TorrentId,
+    FilePriority, PeerInfo, SessionStats, Settings, SettingsPatch, StatsSample, TorrentDetails, TorrentFile, TorrentId,
     TorrentSource, TorrentState, TorrentSummary,
 };
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::db::{Counter, Db, TorrentRecord};
+use crate::db::{Counter, Db, Picking, TorrentRecord};
 
 pub use crate::db::Db as Database;
 
@@ -188,6 +188,8 @@ struct Pending {
     error: Option<String>,
     added_at: i64,
     output_folder: String,
+    /// Picking mode to apply once the torrent is added (can be toggled meanwhile).
+    sequential: bool,
     abort: Option<tokio::task::AbortHandle>,
 }
 
@@ -280,6 +282,7 @@ impl LocalBackend {
             next_pending: AtomicU64::new(0),
             peer_rates: Mutex::new(PeerRates::default()),
         });
+        inner.restore_picking();
         tokio::spawn(ticker(Arc::downgrade(&inner)));
         Ok(Self { inner, _runtime: None })
     }
@@ -466,6 +469,7 @@ impl Inner {
             output_folder: h.output_folder().to_string_lossy().into_owned(),
             added_at: Some(rec.added_at),
             completed_at: rec.completed_at,
+            sequential: h.picker_settings().mode == PiecePicking::Sequential,
         }
     }
 
@@ -480,12 +484,14 @@ impl Inner {
                 comment: None,
                 created_by: None,
                 creation_date: None,
+                have_pieces: None,
             });
         }
         let h = self.handle(id)?;
         let summary = self.summarize(&h);
         let stats = h.stats();
         let only: Option<HashSet<usize>> = h.only_files().map(|v| v.into_iter().collect());
+        let picker = h.picker_settings();
         let mut trackers: Vec<String> = h.shared().trackers.iter().map(|u| u.to_string()).collect();
         trackers.sort();
 
@@ -501,6 +507,8 @@ impl Inner {
                     length: f.len,
                     progress_bytes: stats.file_progress.get(index).copied().unwrap_or(0),
                     included: only.as_ref().is_none_or(|o| o.contains(&index)),
+                    priority: from_rq_priority(picker.priority_of(index)),
+                    offset: f.offset_in_torrent,
                 })
                 .collect::<Vec<_>>();
             let lengths = m.info.lengths();
@@ -520,6 +528,7 @@ impl Inner {
             comment: extra.comment,
             created_by: extra.created_by,
             creation_date: extra.creation_date,
+            have_pieces: h.have_pieces().map(proto::PieceMap),
         })
     }
 
@@ -565,7 +574,15 @@ impl Inner {
         match req.source {
             // Parsing a .torrent is local and fast: add synchronously.
             TorrentSource::File { bytes } => {
-                self.resolve_and_add(AddTorrent::from_bytes(bytes), base, req.paused, req.only_files, Vec::new()).await
+                self.resolve_and_add(
+                    AddTorrent::from_bytes(bytes),
+                    base,
+                    req.paused,
+                    req.only_files,
+                    Vec::new(),
+                    req.sequential,
+                )
+                .await
             }
             // Magnets (and remote .torrent URLs) may take a long time to resolve: show a
             // pending row right away and finish in the background.
@@ -599,21 +616,44 @@ impl Inner {
                         error: None,
                         added_at: unix_now(),
                         output_folder: base.to_string_lossy().into_owned(),
+                        sequential: req.sequential,
                         abort: None,
                     },
                 );
                 let inner = self.clone();
                 let task = tokio::spawn(async move {
                     let res = inner
-                        .resolve_and_add(AddTorrent::from_url(url), base, req.paused, req.only_files, trackers)
+                        .resolve_and_add(
+                            AddTorrent::from_url(url),
+                            base,
+                            req.paused,
+                            req.only_files,
+                            trackers,
+                            req.sequential,
+                        )
                         .await;
-                    let mut pending = inner.pending.lock().unwrap();
                     match res {
-                        Ok(_) => {
-                            pending.remove(&id);
+                        Ok(added) => {
+                            let toggled = inner
+                                .pending
+                                .lock()
+                                .unwrap()
+                                .remove(&id)
+                                .map(|p| p.sequential)
+                                .filter(|&seq| seq != req.sequential);
+                            // Sequential was toggled while the metadata was being fetched.
+                            if let Some(seq) = toggled
+                                && !added.already_existed
+                                && let Err(e) = inner.update_picking(added.id, |p, _| {
+                                    p.sequential = seq;
+                                    Ok(())
+                                })
+                            {
+                                tracing::warn!("applying picking mode to torrent {}: {e}", added.id);
+                            }
                         }
                         Err(e) => {
-                            if let Some(p) = pending.get_mut(&id) {
+                            if let Some(p) = inner.pending.lock().unwrap().get_mut(&id) {
                                 p.error = Some(e.message);
                                 p.abort = None;
                             }
@@ -637,6 +677,7 @@ impl Inner {
         paused: bool,
         only_files: Option<Vec<usize>>,
         trackers: Vec<String>,
+        sequential: bool,
     ) -> proto::Result<proto::AddTorrentResponse> {
         let bad = |e: anyhow::Error| Error::bad_request(format!("{e:#}"));
         let listed = self
@@ -663,6 +704,7 @@ impl Inner {
             overwrite: true,
             initial_peers: (!listed.seen_peers.is_empty()).then_some(listed.seen_peers),
             trackers: (!trackers.is_empty()).then_some(trackers),
+            picker: Some(to_rq(&Picking { sequential, file_priorities: Vec::new() })),
             ..Default::default()
         };
         let resp =
@@ -672,11 +714,63 @@ impl Inner {
             librqbit::AddTorrentResponse::AlreadyManaged(id, h) => (id, h, true),
             librqbit::AddTorrentResponse::ListOnly(_) => return Err(Error::internal("unexpected list-only response")),
         };
+        if sequential && !already_existed {
+            self.save_picking(&handle);
+        }
         Ok(proto::AddTorrentResponse {
             id: id as TorrentId,
             info_hash: handle.info_hash().as_string(),
             already_existed,
         })
+    }
+
+    /// Reapplies the stored picking settings to the torrents librqbit restored.
+    fn restore_picking(&self) {
+        let stored = match self.db.load_picking() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("loading piece picking settings: {e:#}");
+                return;
+            }
+        };
+        let handles: Vec<Arc<ManagedTorrent>> = self.session.with_torrents(|it| it.map(|(_, h)| h.clone()).collect());
+        for h in handles {
+            if let Some(p) = stored.get(&h.info_hash().as_string())
+                && let Err(e) = h.set_picker_settings(to_rq(p))
+            {
+                tracing::warn!("restoring piece picking of {}: {e:#}", h.info_hash().as_string());
+            }
+        }
+    }
+
+    fn save_picking(&self, h: &ManagedTorrent) {
+        let p = from_rq(&h.picker_settings());
+        if let Err(e) = self.db.save_picking(&h.info_hash().as_string(), &p) {
+            tracing::warn!("saving piece picking settings: {e:#}");
+        }
+    }
+
+    /// Edits a torrent's picking settings with `f`, which also gets the torrent's
+    /// file count (`None` while its metadata isn't known), then applies and persists them.
+    fn update_picking(
+        &self,
+        id: TorrentId,
+        f: impl FnOnce(&mut Picking, Option<usize>) -> proto::Result<()>,
+    ) -> proto::Result<()> {
+        if let Some(p) = self.pending.lock().unwrap().get_mut(&id) {
+            // Still fetching metadata: only the mode can be chosen, applied once added.
+            let mut picking = Picking { sequential: p.sequential, file_priorities: Vec::new() };
+            f(&mut picking, None)?;
+            p.sequential = picking.sequential;
+            return Ok(());
+        }
+        let h = self.handle(id)?;
+        let file_count = h.with_metadata(|m| m.file_infos.len()).ok();
+        let mut picking = from_rq(&h.picker_settings());
+        f(&mut picking, file_count)?;
+        h.set_picker_settings(to_rq(&picking)).map_err(|e| Error::bad_request(format!("{e:#}")))?;
+        self.save_picking(&h);
+        Ok(())
     }
 
     fn pending_summaries(&self) -> Vec<TorrentSummary> {
@@ -702,6 +796,7 @@ impl Inner {
                 output_folder: p.output_folder.clone(),
                 added_at: Some(p.added_at),
                 completed_at: None,
+                sequential: p.sequential,
             })
             .collect();
         out.sort_by_key(|t| t.id);
@@ -837,6 +932,33 @@ impl Backend for LocalBackend {
         .await
     }
 
+    async fn set_sequential(&self, id: TorrentId, sequential: bool) -> proto::Result<()> {
+        self.run(move |inner| async move {
+            inner.update_picking(id, |p, _| {
+                p.sequential = sequential;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn set_file_priority(&self, id: TorrentId, files: Vec<usize>, priority: FilePriority) -> proto::Result<()> {
+        self.run(move |inner| async move {
+            inner.update_picking(id, |p, file_count| {
+                let n = file_count.ok_or_else(|| Error::bad_request("torrent metadata isn't available yet"))?;
+                if let Some(bad) = files.iter().find(|&&i| i >= n) {
+                    return Err(Error::bad_request(format!("no file {bad} in torrent {id}")));
+                }
+                p.file_priorities.resize(n, FilePriority::Normal);
+                for i in files {
+                    p.file_priorities[i] = priority;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     async fn session_stats(&self) -> proto::Result<SessionStats> {
         self.run(|inner| async move { Ok(inner.snapshot().1) }).await
     }
@@ -871,6 +993,36 @@ impl Backend for LocalBackend {
             tokio::fs::create_dir_all(&path).await.map_err(|e| Error::bad_request(format!("creating {path}: {e}")))
         })
         .await
+    }
+}
+
+fn to_rq(p: &Picking) -> PickerSettings {
+    PickerSettings {
+        mode: if p.sequential { PiecePicking::Sequential } else { PiecePicking::RarestFirst },
+        file_priorities: p
+            .file_priorities
+            .iter()
+            .map(|p| match p {
+                FilePriority::Low => librqbit::FilePriority::Low,
+                FilePriority::Normal => librqbit::FilePriority::Normal,
+                FilePriority::High => librqbit::FilePriority::High,
+            })
+            .collect(),
+    }
+}
+
+fn from_rq_priority(p: librqbit::FilePriority) -> FilePriority {
+    match p {
+        librqbit::FilePriority::Low => FilePriority::Low,
+        librqbit::FilePriority::Normal => FilePriority::Normal,
+        librqbit::FilePriority::High => FilePriority::High,
+    }
+}
+
+fn from_rq(s: &PickerSettings) -> Picking {
+    Picking {
+        sequential: s.mode == PiecePicking::Sequential,
+        file_priorities: s.file_priorities.iter().copied().map(from_rq_priority).collect(),
     }
 }
 

@@ -9,12 +9,13 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex};
-use storm_proto::{PeerInfo, TorrentDetails, TorrentFile, TorrentId, TorrentSummary};
+use storm_proto::{FilePriority, PeerInfo, TorrentDetails, TorrentFile, TorrentId, TorrentSummary};
 
 use crate::caps::BackendHandle;
 use crate::format;
@@ -22,6 +23,7 @@ use crate::state::AppState;
 use crate::ui::{self, spawn_op};
 use crate::views::file_tree::{self, Check, Row, RowKind, check_of};
 use crate::views::local_copy::{Copies, CopyRequest, CopyState};
+use crate::views::piece_map;
 use crate::views::torrent_table::display_name;
 
 const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -36,6 +38,7 @@ const INDENT: f32 = 16.;
 const W_CHECK: f32 = 16.;
 const W_SIZE: f32 = 76.;
 const W_PROGRESS: f32 = 150.;
+const W_PRIORITY: f32 = 76.;
 const W_GET: f32 = 40.;
 const W_ACTIONS: f32 = 56.;
 
@@ -172,9 +175,9 @@ impl DetailsPane {
         }
     }
 
-    /// One loop per (torrent, tab): Files refreshes details (per-file progress),
-    /// Peers refreshes peers, General fetches details once (live numbers come
-    /// from the snapshot stream). Replacing the task cancels the previous loop.
+    /// One loop per (torrent, tab): Files and General refresh details (per-file
+    /// progress, the piece map), Peers refreshes peers and fetches details once.
+    /// Replacing the task cancels the previous loop.
     fn restart_poll(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.current() else {
             self.poll = Task::ready(());
@@ -185,10 +188,8 @@ impl DetailsPane {
         self.poll = cx.spawn(async move |this, cx| {
             loop {
                 let need_details = match tab {
-                    DetailsTab::Files => true,
-                    DetailsTab::General | DetailsTab::Peers => {
-                        this.read_with(cx, |p, _| p.details.is_none()).unwrap_or(false)
-                    }
+                    DetailsTab::Files | DetailsTab::General => true,
+                    DetailsTab::Peers => this.read_with(cx, |p, _| p.details.is_none()).unwrap_or(false),
                 };
                 if need_details {
                     let r = backend.torrent_details(id).await;
@@ -218,9 +219,6 @@ impl DetailsPane {
                     if ok.is_err() {
                         return;
                     }
-                }
-                if tab == DetailsTab::General {
-                    return;
                 }
                 cx.background_executor().timer(POLL_EVERY).await;
             }
@@ -349,6 +347,65 @@ impl DetailsPane {
                 let _ = this.update(cx, |p, cx| p.restart_poll(cx));
             },
         );
+    }
+
+    // -- priorities -----------------------------------------------------------
+
+    /// Sets the download priority of the files at `positions`.
+    fn set_priority(
+        &mut self,
+        positions: Vec<usize>,
+        priority: FilePriority,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(details) = &mut self.details else { return };
+        let id = details.summary.id;
+        let mut indices = Vec::with_capacity(positions.len());
+        // Optimistic: change now, the next poll confirms.
+        for pos in positions {
+            if let Some(f) = details.files.get_mut(pos) {
+                f.priority = priority;
+                indices.push(f.index);
+            }
+        }
+        if indices.is_empty() {
+            return;
+        }
+        cx.notify();
+        let backend = BackendHandle::get(cx).backend;
+        let this = cx.entity().downgrade();
+        spawn_op(
+            window,
+            cx,
+            "Changing file priority",
+            async move { backend.set_file_priority(id, indices, priority).await },
+            move |_, _, cx| {
+                let _ = this.update(cx, |p, cx| p.restart_poll(cx));
+            },
+        );
+    }
+
+    /// A menu of the three priorities, applying the picked one to `positions`.
+    /// `current` gets the check mark (`None` for a mix).
+    fn priority_menu(
+        &self,
+        positions: Vec<usize>,
+        current: Option<FilePriority>,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let this = cx.entity().downgrade();
+        move |mut menu, _, _| {
+            for p in FilePriority::ALL {
+                let (this, positions) = (this.clone(), positions.clone());
+                menu = menu.item(PopupMenuItem::new(p.label()).checked(current == Some(p)).on_click(
+                    move |_, window, cx| {
+                        let _ = this.update(cx, |d, cx| d.set_priority(positions.clone(), p, window, cx));
+                    },
+                ));
+            }
+            menu
+        }
     }
 
     // -- download to this PC -----------------------------------------------
@@ -534,44 +591,60 @@ impl DetailsPane {
             Some((n, len)) => format!("{n} × {}", format::bytes(len as u64)),
             None => dash(),
         };
-        let p = t.progress();
         let folder = t.output_folder.clone();
 
-        let transfer = section("Transfer", cx)
-            .child(kv(
-                "Progress",
-                h_flex()
-                    .gap_2()
-                    .child(div().w(px(120.)).child(thin_bar(
-                        p,
-                        if p >= 1.0 { theme.success } else { theme.progress_bar },
-                        cx,
-                    )))
-                    .child(format!(
-                        "{} of {} · {}",
-                        format::bytes(t.progress_bytes),
-                        format::bytes(t.total_bytes),
-                        format::percent(p)
-                    )),
-                cx,
-            ))
-            .child(kv("State", format::state(t.state), cx))
+        let order_menu =
+            {
+                let (state, sequential) = (self.state.clone(), t.sequential);
+                move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+                    [(false, "Rarest first"), (true, "Sequential")].into_iter().fold(menu, |menu, (seq, label)| {
+                        let state = state.clone();
+                        menu.item(PopupMenuItem::new(label).checked(sequential == seq).on_click(
+                            move |_, window, cx| crate::state::set_sequential(&state, vec![id], seq, window, cx),
+                        ))
+                    })
+                }
+            };
+        let transfer = column()
+            .child(kv("Progress", progress_row(&t, d, cx), cx))
             .child(kv("Speed", speeds(&t, cx), cx))
-            .child(kv("ETA", or_dash(format::eta(t.eta_secs)), cx))
             .child(kv(
-                "Down / up",
-                format!("{} / {}", format::bytes(t.downloaded_bytes), format::bytes(t.uploaded_bytes)),
+                "Transferred",
+                format!(
+                    "{} down · {} up · ratio {}",
+                    format::bytes(t.downloaded_bytes),
+                    format::bytes(t.uploaded_bytes),
+                    format::ratio(t.ratio())
+                ),
                 cx,
             ))
-            .child(kv("Ratio", format::ratio(t.ratio()), cx))
             .child(kv(
                 "Peers",
                 format!("{} connected · {} seeders · {} seen", t.peers_live, t.seeders_live, t.peers_seen),
                 cx,
+            ))
+            .child(kv(
+                "Order",
+                // Text-sized and pulled left by its padding, so the label lines up with the
+                // values above it; the caret marks it as a choice.
+                Button::new("order")
+                    .small()
+                    .compact()
+                    .ghost()
+                    .ml(px(-6.))
+                    .mt(px(-2.))
+                    .label(if t.sequential { "Sequential" } else { "Rarest first" })
+                    .dropdown_caret(true)
+                    .tooltip(
+                        "Rarest first: fetch the pieces fewest peers have. Usually fastest, and best for the swarm.\n\
+                         Sequential: fetch in order, file by file, so media can be previewed while downloading.",
+                    )
+                    .dropdown_menu(order_menu),
+                cx,
             ));
 
         let hash = t.info_hash.clone();
-        let torrent = section("Torrent", cx)
+        let torrent = column()
             .child(kv("Name", div().truncate().child(display_name(&t)), cx))
             .child(kv(
                 "Info hash",
@@ -671,6 +744,7 @@ impl DetailsPane {
             .child(div().flex_1().child("Name"))
             .child(div().w(px(W_SIZE)).text_right().child("Size"))
             .child(div().w(px(W_PROGRESS)).child("Progress"))
+            .child(div().w(px(W_PRIORITY)).text_center().child("Priority"))
             .child(div().w(px(W_GET)).child("Get"))
             .child(div().w(px(W_ACTIONS)));
 
@@ -706,6 +780,7 @@ impl DetailsPane {
         } else {
             let complete = self.checked_complete().len();
             let checked: Vec<usize> = self.checked.iter().copied().collect();
+            let prio_menu = self.priority_menu(checked.clone(), common_priority(files, &checked), cx);
             let (inc, skip) = (checked.clone(), checked);
             h_flex()
                 .gap_1()
@@ -732,6 +807,15 @@ impl DetailsPane {
                             .on_click(cx.listener(|this, _, w, cx| this.download_checked(w, cx))),
                     )
                 })
+                .child(
+                    Button::new("priority")
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ChevronsUpDown)
+                        .label("Priority")
+                        .tooltip("Higher-priority files are downloaded first")
+                        .dropdown_menu(prio_menu),
+                )
                 .child(
                     Button::new("include")
                         .xsmall()
@@ -866,16 +950,40 @@ impl DetailsPane {
                 |n, e| n.child(div().flex_shrink(1.).min_w_0().truncate().text_xs().text_color(theme.danger).child(e)),
             );
 
+        let have = match (&details.have_pieces, details.piece_length) {
+            (Some(map), Some(pl)) if p < 1.0 => {
+                Some(piece_map::pieces_of(map, files.iter().map(|f| piece_map::file_pieces(f, pl))))
+            }
+            _ => None,
+        };
+        let bar = div().flex_1().child(piece_bar(p, have, cx));
         let progress = if included == Check::Off && p < 1.0 {
             div().w(px(W_PROGRESS)).text_xs().text_color(muted).child("Skipped").into_any_element()
         } else {
             h_flex()
                 .w(px(W_PROGRESS))
                 .gap_2()
-                .child(div().flex_1().child(thin_bar(p, if p >= 1.0 { theme.success } else { theme.progress_bar }, cx)))
+                .child(bar)
                 .child(div().w(px(40.)).text_xs().text_right().text_color(muted).child(format::percent(p)))
                 .into_any_element()
         };
+
+        let priority = common_priority(&details.files, &positions);
+        let prio_label = priority.map_or("Mixed", |p| p.label());
+        let prio_color = match priority {
+            Some(FilePriority::High) => theme.foreground,
+            _ => muted,
+        };
+        let prio = div().id(("prio-wrap", ix)).w(px(W_PRIORITY)).on_click(|_, _, cx| cx.stop_propagation()).child(
+            Button::new(("prio", ix))
+                .xsmall()
+                .ghost()
+                .w_full()
+                .text_color(prio_color)
+                .label(prio_label)
+                .tooltip("Change download priority")
+                .dropdown_menu(self.priority_menu(positions.clone(), priority, cx)),
+        );
 
         let get_files = positions.clone();
         let get = div().id(("get-wrap", ix)).w(px(W_GET)).on_click(|_, _, cx| cx.stop_propagation()).child(
@@ -994,6 +1102,7 @@ impl DetailsPane {
                 .child(name)
                 .child(div().w(px(W_SIZE)).text_right().text_xs().text_color(muted).child(format::bytes(len)))
                 .child(progress)
+                .child(prio)
                 .child(get)
                 .child(actions)
                 .into_any_element(),
@@ -1154,21 +1263,54 @@ fn speeds(t: &TorrentSummary, cx: &App) -> impl IntoElement {
         .gap_3()
         .child(ui::icon_label(IconName::ArrowDown, format::speed_always(t.down_bps), Some(muted)))
         .child(ui::icon_label(IconName::ArrowUp, format::speed_always(t.up_bps), Some(muted)))
+        .when_some(Some(format::eta(t.eta_secs)).filter(|e| !e.is_empty()), |row, eta| {
+            row.child(div().text_color(muted).child(format!("{eta} left")))
+        })
 }
 
-/// A titled column of key/value rows (General tab).
-fn section(title: &'static str, cx: &App) -> Div {
-    v_flex().flex_1().min_w_0().gap_1().child(
-        div()
-            .pb_1()
-            .mb_1()
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(cx.theme().muted_foreground)
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(title),
-    )
+/// General tab's Progress value: a bar of the pieces, then the numbers.
+fn progress_row(t: &TorrentSummary, d: Option<&TorrentDetails>, cx: &App) -> impl IntoElement {
+    let p = t.progress();
+    let have = d.and_then(|d| {
+        let (map, count) = (d.have_pieces.as_ref()?, d.piece_count?);
+        Some((0..count).map(|i| map.has(i)).collect())
+    });
+    h_flex().gap_2().child(div().w(px(160.)).child(piece_bar(p, have, cx))).child(format!(
+        "{} of {} · {} · {}",
+        format::bytes(t.progress_bytes),
+        format::bytes(t.total_bytes),
+        format::percent(p),
+        format::state(t.state)
+    ))
+}
+
+/// A thin progress bar. While incomplete and the pieces are known (`have`, one
+/// flag per piece), it shows which parts are downloaded rather than just how much.
+fn piece_bar(fraction: f64, have: Option<Vec<bool>>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let color = if fraction >= 1.0 { theme.success } else { theme.progress_bar };
+    match have {
+        Some(have) if fraction < 1.0 => div()
+            .w_full()
+            .h(px(4.))
+            .rounded_full()
+            .overflow_hidden()
+            .child(piece_map::strip(have, color, theme.muted_foreground.opacity(0.15)))
+            .into_any_element(),
+        _ => thin_bar(fraction, color, cx).into_any_element(),
+    }
+}
+
+/// A column of key/value rows (General tab).
+fn column() -> Div {
+    v_flex().flex_1().min_w_0().gap_1()
+}
+
+/// The priority shared by all files at `positions`, or `None` if they differ.
+fn common_priority(files: &[TorrentFile], positions: &[usize]) -> Option<FilePriority> {
+    let mut it = positions.iter().filter_map(|p| files.get(*p)).map(|f| f.priority);
+    let first = it.next()?;
+    it.all(|p| p == first).then_some(first)
 }
 
 fn kv(label: &'static str, value: impl IntoElement, cx: &App) -> impl IntoElement {

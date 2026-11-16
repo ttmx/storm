@@ -154,7 +154,15 @@ mod tests {
         paths
             .iter()
             .enumerate()
-            .map(|(i, p)| TorrentFile { index: i, path: (*p).into(), length: 10, progress_bytes: 0, included: true })
+            .map(|(i, p)| TorrentFile {
+                index: i,
+                path: (*p).into(),
+                length: 10,
+                progress_bytes: 0,
+                included: true,
+                priority: Default::default(),
+                offset: 0,
+            })
             .collect()
     }
 

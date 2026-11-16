@@ -59,6 +59,11 @@ gpui_kit::actions!(
     ]
 );
 
+/// Switches the selected torrents to sequential (`true`) or rarest-first picking.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = storm, no_json)]
+pub struct SetSequential(pub bool);
+
 /// Shows or hides a column of the torrent list (from its header menu).
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = storm, no_json)]
@@ -390,6 +395,14 @@ impl StormApp {
         let state = self.state.read(cx);
         let names = ids.iter().filter_map(|id| state.torrent(*id)).map(display_name).collect();
         RemoveDialog::open(ids, names, delete_files, window, cx);
+    }
+
+    fn set_sequential(&mut self, action: &SetSequential, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let ids: Vec<_> = self.selected_torrents(state, cx).iter().map(|t| t.id).collect();
+        if !ids.is_empty() {
+            crate::state::set_sequential(&self.state, ids, action.0, window, cx);
+        }
     }
 
     fn settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -843,6 +856,7 @@ impl Render for StormApp {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::copy_magnet))
+            .on_action(cx.listener(Self::set_sequential))
             .on_action(cx.listener(Self::copy_info_hash))
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::toggle_pause))

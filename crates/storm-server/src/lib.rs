@@ -19,8 +19,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 use storm_engine::LocalBackend;
 use storm_proto::{
-    AddTorrentRequest, Backend, BackendInfo, DirListing, Error, ErrorKind, PeerInfo, SessionStats, Settings,
-    SettingsPatch, StatsSample, TorrentDetails, TorrentId, TorrentSummary,
+    AddTorrentRequest, Backend, BackendInfo, DirListing, Error, ErrorKind, FilePriority, PeerInfo, SessionStats,
+    Settings, SettingsPatch, StatsSample, TorrentDetails, TorrentId, TorrentSummary,
 };
 
 #[derive(Clone)]
@@ -41,6 +41,8 @@ pub fn router(backend: LocalBackend, token: impl Into<Arc<str>>) -> Router {
         .route("/torrents/{id}/pause", post(pause))
         .route("/torrents/{id}/resume", post(resume))
         .route("/torrents/{id}/files", put(set_included_files))
+        .route("/torrents/{id}/files/priority", put(set_file_priority))
+        .route("/torrents/{id}/sequential", put(set_sequential))
         .route("/torrents/{id}/files/{index}/content", get(file_content))
         .route("/stats", get(session_stats))
         .route("/stats/history", get(stats_history))
@@ -177,6 +179,33 @@ async fn set_included_files(
     Json(files): Json<Vec<usize>>,
 ) -> ApiResult<()> {
     Ok(Json(s.backend.set_included_files(id, files).await?))
+}
+
+#[derive(Deserialize)]
+struct SequentialBody {
+    sequential: bool,
+}
+
+async fn set_sequential(
+    State(s): State<AppState>,
+    Path(id): Path<TorrentId>,
+    Json(b): Json<SequentialBody>,
+) -> ApiResult<()> {
+    Ok(Json(s.backend.set_sequential(id, b.sequential).await?))
+}
+
+#[derive(Deserialize)]
+struct FilePriorityBody {
+    files: Vec<usize>,
+    priority: FilePriority,
+}
+
+async fn set_file_priority(
+    State(s): State<AppState>,
+    Path(id): Path<TorrentId>,
+    Json(b): Json<FilePriorityBody>,
+) -> ApiResult<()> {
+    Ok(Json(s.backend.set_file_priority(id, b.files, b.priority).await?))
 }
 
 async fn file_content(

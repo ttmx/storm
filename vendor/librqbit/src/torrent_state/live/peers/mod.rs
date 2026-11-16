@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 
 use crate::{
     Error,
+    piece_picking::PieceAvailability,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle},
 };
@@ -23,6 +24,10 @@ pub(crate) struct PeerStates {
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
+    // [Storm patch] How many live peers have each piece, for rarest-first.
+    // Kept in sync with the live peers' bitfields under each peer's shard lock:
+    // see update_bitfield, on_have (live/mod.rs) and Peer::set_state/destroy.
+    pub availability: PieceAvailability,
 }
 
 impl Drop for PeerStates {
@@ -88,6 +93,9 @@ impl PeerStates {
         let s = p.get_state();
         self.stats.dec(s);
         self.session_stats.dec(s);
+        if let PeerState::Live(l) = s {
+            self.availability.sub(&l.bitfield);
+        }
 
         Some(p)
     }
@@ -118,6 +126,8 @@ impl PeerStates {
         total_pieces: usize,
     ) -> Option<()> {
         self.with_live_mut(handle, "update_bitfield", |live| {
+            self.availability.sub(&live.bitfield);
+            self.availability.add(&bitfield);
             live.bitfield = bitfield;
             self.update_seeder_flag(live, total_pieces);
         })
@@ -203,6 +213,7 @@ mod tests {
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
+            availability: Default::default(),
         }
     }
 

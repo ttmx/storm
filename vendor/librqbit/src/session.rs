@@ -252,6 +252,9 @@ pub struct AddTorrentOptions {
     /// Start in paused state.
     #[serde(default)]
     pub paused: bool,
+    /// [Storm patch] Initial piece picking settings (see `piece_picking`).
+    #[serde(skip)]
+    pub picker: Option<crate::PickerSettings>,
     /// A regex to only download files matching it.
     pub only_files_regex: Option<String>,
     /// An explicit list of file IDs to download.
@@ -1376,6 +1379,7 @@ impl Session {
                 session: Arc::downgrade(self),
                 magnet_name: name,
                 client_name_and_version: self.client_name_and_version.clone(),
+                picker: parking_lot::RwLock::new(opts.picker.clone().unwrap_or_default()),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(

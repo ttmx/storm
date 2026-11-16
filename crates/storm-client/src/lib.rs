@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use storm_proto::{
     self as proto, AddTorrentRequest, AddTorrentResponse, Backend, BackendInfo, BackendKind, DirListing, Error,
-    ErrorKind, Event, EventStream, PeerInfo, SessionStats, Settings, SettingsPatch, StatsSample, TorrentDetails,
-    TorrentId, TorrentSummary,
+    ErrorKind, Event, EventStream, FilePriority, PeerInfo, SessionStats, Settings, SettingsPatch, StatsSample,
+    TorrentDetails, TorrentId, TorrentSummary,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Handle, Runtime};
@@ -260,6 +260,24 @@ impl Backend for RemoteBackend {
 
     async fn set_included_files(&self, id: TorrentId, files: Vec<usize>) -> proto::Result<()> {
         self.send_json(Method::PUT, format!("torrents/{id}/files"), files).await
+    }
+
+    async fn set_sequential(&self, id: TorrentId, sequential: bool) -> proto::Result<()> {
+        self.send_json(
+            Method::PUT,
+            format!("torrents/{id}/sequential"),
+            serde_json::json!({ "sequential": sequential }),
+        )
+        .await
+    }
+
+    async fn set_file_priority(&self, id: TorrentId, files: Vec<usize>, priority: FilePriority) -> proto::Result<()> {
+        self.send_json(
+            Method::PUT,
+            format!("torrents/{id}/files/priority"),
+            serde_json::json!({ "files": files, "priority": priority }),
+        )
+        .await
     }
 
     async fn session_stats(&self) -> proto::Result<SessionStats> {

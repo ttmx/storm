@@ -44,6 +44,9 @@ impl Peer {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.inc(&state);
         }
+        if let PeerState::Live(l) = &state {
+            counters.availability.add(&l.bitfield);
+        }
         Self {
             addr,
             state,
@@ -146,6 +149,9 @@ impl Peer {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.dec(&self.state);
         }
+        if let PeerState::Live(l) = &self.state {
+            counters.availability.sub(&l.bitfield);
+        }
         if let (Some(addr), PeerState::Live(..)) = (self.outgoing_address, &self.state) {
             counters.live_outgoing_peers.write().remove(&addr);
         }
@@ -154,6 +160,12 @@ impl Peer {
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.incdec(&self.state, &new);
+        }
+        if let PeerState::Live(l) = &self.state {
+            counters.availability.sub(&l.bitfield);
+        }
+        if let PeerState::Live(l) = &new {
+            counters.availability.add(&l.bitfield);
         }
         if let Some(addr) = self.outgoing_address {
             if matches!(&self.state, PeerState::Live(..)) {

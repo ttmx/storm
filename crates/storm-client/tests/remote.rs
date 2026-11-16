@@ -95,6 +95,15 @@ async fn remote_backend_end_to_end() {
     assert_eq!(details.files[0].path, "movie.bin");
     assert!(remote.torrent_peers(added.id).await.unwrap().is_empty());
 
+    // Piece picking round trip.
+    remote.set_sequential(added.id, true).await.unwrap();
+    remote.set_file_priority(added.id, vec![0], storm_proto::FilePriority::High).await.unwrap();
+    let details = remote.torrent_details(added.id).await.unwrap();
+    assert!(details.summary.sequential);
+    assert_eq!(details.files[0].priority, storm_proto::FilePriority::High);
+    let err = remote.set_file_priority(added.id, vec![7], storm_proto::FilePriority::Low).await.unwrap_err();
+    assert_eq!(err.kind, storm_proto::ErrorKind::BadRequest);
+
     // Download to "this PC".
     let dest = tmp.path().join("downloaded.bin");
     remote.download_file(added.id, 0, dest.clone()).await.unwrap();

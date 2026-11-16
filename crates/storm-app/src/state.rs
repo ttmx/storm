@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use gpui::{Context, Task};
+use gpui::{App, Context, Entity, Task, Window};
 use storm_proto::{Backend, Event, SessionStats, Settings, StatsSample, TorrentId, TorrentState, TorrentSummary};
+
+use crate::ui::spawn_op;
 
 /// How much speed history the status-bar chart keeps.
 pub const HISTORY_SECS: i64 = 10 * 60;
@@ -127,6 +129,22 @@ impl AppState {
     }
 }
 
+/// Switches torrents between sequential and rarest-first piece picking. The
+/// list reflects it right away; the next snapshot confirms it.
+pub fn set_sequential(state: &Entity<AppState>, ids: Vec<TorrentId>, on: bool, window: &Window, cx: &mut App) {
+    let backend = state.update(cx, |s, cx| {
+        for t in s.torrents.iter_mut().filter(|t| ids.contains(&t.id)) {
+            t.sequential = on;
+        }
+        cx.notify();
+        s.backend.clone()
+    });
+    for id in ids {
+        let b = backend.clone();
+        spawn_op(window, cx, "Changing download order", async move { b.set_sequential(id, on).await }, |_, _, _| {});
+    }
+}
+
 /// The quick filters above the torrent list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Filter {
@@ -243,6 +261,7 @@ mod tests {
             output_folder: String::new(),
             added_at: None,
             completed_at: None,
+            sequential: false,
         }
     }
 
