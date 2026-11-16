@@ -8,6 +8,7 @@ extern crate gpui_kit as gpui;
 mod app;
 mod backdrop;
 mod caps;
+mod default_app;
 mod dev;
 mod format;
 mod prefs;
@@ -102,6 +103,7 @@ fn main() {
         Err(_) => None,
     };
     let forwarded = instance.as_mut().and_then(|i| i.take_requests());
+    default_app::refresh_if_stale();
 
     // Start the engine before the UI: it blocks briefly while the session comes up.
     let engine = config.and_then(LocalBackend::start_with_own_runtime);
