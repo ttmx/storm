@@ -83,7 +83,8 @@ impl Header {
 
     fn render(&self, cx: &App) -> AnyElement {
         let accent = self.danger.then(|| cx.theme().danger);
-        ui::dialog_header(self.icon.clone(), self.title.clone(), Some(self.description.clone()), accent, cx)
+        let description = Some(self.description.clone()).filter(|d| !d.is_empty());
+        ui::dialog_header(self.icon.clone(), self.title.clone(), description, accent, cx)
     }
 }
 
@@ -312,14 +313,12 @@ impl Render for AddTorrentDialog {
                 cx.notify();
             },
         ));
-        let sequential = Checkbox::new("sequential")
-            .label("Download sequentially")
-            .tooltip("Fetch pieces in order, file by file, so media can be previewed while downloading. Slower and less helpful to other peers than the default (rarest first).")
-            .checked(self.sequential)
-            .on_click(cx.listener(|this, v: &bool, _, cx| {
+        let sequential = Checkbox::new("sequential").label("Download sequentially").checked(self.sequential).on_click(
+            cx.listener(|this, v: &bool, _, cx| {
                 this.sequential = *v;
                 cx.notify();
-            }));
+            }),
+        );
         v_flex()
             .pt_2()
             .gap(px(ui::space::ROW))
@@ -488,7 +487,7 @@ impl SettingsDialog {
                 busy: false,
             }
         });
-        let header = Header::new(LucideIcon::SlidersHorizontal, "Settings", "Downloads, network, bandwidth and more");
+        let header = Header::new(LucideIcon::SlidersHorizontal, "Settings", "");
         window
             .open_dialog(cx, move |d, _, cx| ui::modal(d, header.render(cx), ui::width::MD, cx).child(dialog.clone()));
     }
@@ -546,13 +545,9 @@ impl SettingsDialog {
 impl SettingsDialog {
     /// Whether Storm opens magnet links and .torrent files, with a button to make it so.
     fn render_default_app(&self, handles: crate::default_app::Handles, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
         let both = handles.magnet && handles.torrent;
-        let label = if both {
-            "Storm opens magnet links and .torrent files"
-        } else {
-            "Open magnet links and .torrent files with Storm"
-        };
+        let label =
+            if both { "Default for magnet links and .torrent files" } else { "Magnet links and .torrent files" };
         let set_default = Button::new("set-default").small().outline().label("Set as default").on_click(cx.listener(
             |_, _: &ClickEvent, window, cx| {
                 if let Err(e) = crate::default_app::register() {
@@ -560,7 +555,7 @@ impl SettingsDialog {
                     return;
                 }
                 if crate::default_app::status().is_some_and(|h| h.magnet && h.torrent) {
-                    ui::notify_info(window, cx, "Storm now opens magnet links and .torrent files.");
+                    ui::notify_info(window, cx, "Storm is now the default.");
                 } else {
                     // Windows only lets the user switch from an app they picked.
                     cx.open_url(crate::default_app::SETTINGS_URL);
@@ -568,25 +563,13 @@ impl SettingsDialog {
                 cx.notify();
             },
         ));
-        v_flex()
-            .pt(px(ui::space::TIGHT))
-            .gap(px(ui::space::TIGHT))
-            .child(
-                h_flex()
-                    .h(ui::control_h())
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_sm().child(label))
-                    .when(!both, |row| row.child(set_default)),
-            )
-            .when(!both, |v| {
-                v.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("If another app opens them now, Windows Settings opens so you can pick Storm instead."),
-                )
-            })
+        h_flex()
+            .mt(px(ui::space::TIGHT))
+            .h(ui::control_h())
+            .items_center()
+            .justify_between()
+            .child(div().text_sm().child(label))
+            .when(!both, |row| row.child(set_default))
             .into_any_element()
     }
 
@@ -722,7 +705,6 @@ impl Render for SettingsDialog {
                             .child(div().flex_1().child(form_row("Download limit", limit(&self.down), None, cx)))
                             .child(div().flex_1().child(form_row("Upload limit", limit(&self.up), None, cx))),
                     )
-                    .child(div().text_xs().text_color(muted).child("Leave empty for unlimited."))
                     .into_any_element(),
                 cx,
             ))
@@ -739,12 +721,6 @@ impl Render for SettingsDialog {
                                 crate::prefs::set_watch_clipboard(cx, *v);
                                 cx.notify();
                             })),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("Offers to add magnet links and .torrent URLs you copy. Applies immediately."),
                     )
                     .children(crate::default_app::status().map(|h| self.render_default_app(h, cx)))
                     .into_any_element(),

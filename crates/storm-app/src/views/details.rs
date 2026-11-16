@@ -635,10 +635,6 @@ impl DetailsPane {
                     .mt(px(-2.))
                     .label(if t.sequential { "Sequential" } else { "Rarest first" })
                     .dropdown_caret(true)
-                    .tooltip(
-                        "Rarest first: fetch the pieces fewest peers have. Usually fastest, and best for the swarm.\n\
-                         Sequential: fetch in order, file by file, so media can be previewed while downloading.",
-                    )
                     .dropdown_menu(order_menu),
                 cx,
             ));
@@ -813,7 +809,6 @@ impl DetailsPane {
                         .ghost()
                         .icon(IconName::ChevronsUpDown)
                         .label("Priority")
-                        .tooltip("Higher-priority files are downloaded first")
                         .dropdown_menu(prio_menu),
                 )
                 .child(
@@ -981,7 +976,6 @@ impl DetailsPane {
                 .w_full()
                 .text_color(prio_color)
                 .label(prio_label)
-                .tooltip("Change download priority")
                 .dropdown_menu(self.priority_menu(positions.clone(), priority, cx)),
         );
 
