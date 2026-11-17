@@ -40,6 +40,17 @@ pub struct BackendInfo {
     pub engine_version: String,
     /// Version of librqbit the engine is built against.
     pub librqbit_version: String,
+    /// The server can replace itself with another release
+    /// ([`Backend::update_server`]). Always false for a local engine.
+    #[serde(default)]
+    pub self_update: bool,
+}
+
+/// Body of `POST /server/update`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateServerRequest {
+    /// The release to install, `x.y.z`. Must be newer than the running one.
+    pub version: String,
 }
 
 impl BackendInfo {
@@ -446,6 +457,14 @@ pub trait Backend: Send + Sync + 'static {
     async fn download_file(&self, id: TorrentId, file_index: usize, dest: std::path::PathBuf) -> Result<()> {
         let _ = (id, file_index, dest);
         Err(Error::bad_request("files of a local backend are already on this machine"))
+    }
+
+    /// Asks a server to install release `version` and restart into it. Returns
+    /// once the new build is in place; the connection then drops and comes
+    /// back on the new version (see [`BackendInfo::self_update`]).
+    async fn update_server(&self, version: String) -> Result<()> {
+        let _ = version;
+        Err(Error::bad_request("this backend can't update itself"))
     }
 }
 

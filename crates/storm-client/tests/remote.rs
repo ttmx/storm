@@ -152,3 +152,15 @@ fn works_without_a_tokio_context() {
         drop(remote); // dropping the owned runtime off-tokio must not panic
     });
 }
+
+/// A server started without an updater says so, and refuses update requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_without_self_update_refuses_updates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_engine, addr) = serve(tmp.path()).await;
+    let remote = RemoteBackend::connect(&addr, TOKEN).await.unwrap();
+    assert!(!remote.info().self_update);
+    let err = remote.update_server("999.0.0".into()).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::BadRequest);
+    assert!(err.message.contains("can't update itself"), "{}", err.message);
+}

@@ -13,7 +13,6 @@ mod dev;
 mod format;
 mod prefs;
 mod remotes;
-mod self_update;
 mod single_instance;
 mod state;
 mod theme;

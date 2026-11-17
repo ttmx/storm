@@ -14,7 +14,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 storm-engine = { version = "0.1.0", path = "../storm-engine" }
 storm-proto = { version = "0.1.0", path = "../storm-proto" }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+storm-update = { path = "../storm-update" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

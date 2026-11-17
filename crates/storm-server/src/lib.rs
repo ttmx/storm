@@ -4,6 +4,8 @@
 //! Bodies are the JSON forms of the `storm-proto` types; errors are a JSON
 //! [`storm_proto::Error`] with a matching HTTP status.
 
+pub mod self_update;
+
 use std::sync::Arc;
 
 use axum::Json;
@@ -20,18 +22,30 @@ use serde::Deserialize;
 use storm_engine::LocalBackend;
 use storm_proto::{
     AddTorrentRequest, Backend, BackendInfo, DirListing, Error, ErrorKind, FilePriority, PeerInfo, SessionStats,
-    Settings, SettingsPatch, StatsSample, TorrentDetails, TorrentId, TorrentSummary,
+    Settings, SettingsPatch, StatsSample, TorrentDetails, TorrentId, TorrentSummary, UpdateServerRequest,
 };
+
+use crate::self_update::SelfUpdate;
 
 #[derive(Clone)]
 struct AppState {
     backend: LocalBackend,
     token: Arc<str>,
+    updater: Option<Arc<SelfUpdate>>,
 }
 
 /// Builds the API router. `token` is required on every request.
 pub fn router(backend: LocalBackend, token: impl Into<Arc<str>>) -> Router {
-    let state = AppState { backend, token: token.into() };
+    router_with_updates(backend, token, None)
+}
+
+/// [`router`], plus `POST /server/update` when `updater` is set.
+pub fn router_with_updates(
+    backend: LocalBackend,
+    token: impl Into<Arc<str>>,
+    updater: Option<Arc<SelfUpdate>>,
+) -> Router {
+    let state = AppState { backend, token: token.into(), updater };
     let api = Router::new()
         .route("/info", get(info))
         .route("/events", get(events))
@@ -48,6 +62,7 @@ pub fn router(backend: LocalBackend, token: impl Into<Arc<str>>) -> Router {
         .route("/stats/history", get(stats_history))
         .route("/settings", get(settings).patch(update_settings))
         .route("/fs/dirs", get(list_dirs).post(create_dir))
+        .route("/server/update", post(update_server))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
     Router::new().nest("/api/v1", api)
@@ -105,7 +120,13 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 // ---------------------------------------------------------------------------
 
 async fn info(State(s): State<AppState>) -> Json<BackendInfo> {
-    Json(s.backend.info())
+    Json(BackendInfo { self_update: s.updater.is_some(), ..s.backend.info() })
+}
+
+async fn update_server(State(s): State<AppState>, Json(req): Json<UpdateServerRequest>) -> ApiResult<()> {
+    let updater = s.updater.ok_or_else(|| Error::bad_request("this server can't update itself"))?;
+    updater.install(req.version).await?;
+    Ok(Json(()))
 }
 
 async fn events(State(s): State<AppState>, ws: WebSocketUpgrade) -> Result<Response, ApiError> {

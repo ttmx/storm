@@ -69,9 +69,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --profile release-server --locked -p storm-server --bin stormd
+      # The tarball is for people; the bare binary is what stormd updates itself from.
       - run: |
           mkdir dist
           tar -czf dist/stormd-linux-x86_64.tar.gz -C target/release-server stormd
+          cp target/release-server/stormd dist/stormd-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: linux

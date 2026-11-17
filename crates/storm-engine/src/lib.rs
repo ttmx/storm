@@ -847,6 +847,7 @@ impl Backend for LocalBackend {
             api_version: proto::API_VERSION,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             librqbit_version: librqbit::version().to_string(),
+            self_update: false,
         }
     }
 

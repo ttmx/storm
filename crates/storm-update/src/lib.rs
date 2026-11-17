@@ -1,9 +1,9 @@
-//! The mechanics of updating from GitHub Releases: find the latest release,
-//! download our asset, verify it, swap it in. No UI here (see `updater`).
+//! Updating from GitHub Releases, for the desktop app and `stormd`: find a
+//! release, download an asset of it, verify it, swap it in for the exe.
 //!
-//! Networking uses the reqwest + rustls stack Storm already ships (for the
-//! remote-server client), on a throwaway single-threaded tokio runtime, since
-//! this runs a few times a day at most.
+//! Networking uses reqwest + rustls on a throwaway single-threaded tokio
+//! runtime, since this runs rarely. The functions block; call them off any
+//! async executor thread.
 //!
 //! A download is only installed if
 //! - its SHA-256 matches the release's `SHA256SUMS` entry, and
@@ -23,12 +23,6 @@ const REPO: &str = "storm";
 /// Public half of the release signing key (`minisign`). The secret half is the
 /// `MINISIGN_SECRET_KEY` secret of the GitHub repo, used by the release workflow.
 pub const MINISIGN_PUBLIC_KEY: &str = "RWTgrKK3kURq20adSQ1+URhVQ95yAr26C+Mx60oZFLDaRcdbca6XgSA8";
-
-/// The release asset this build updates from. Must match the release workflow.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub const ASSET: Option<&str> = Some("storm-windows-x86_64.exe");
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-pub const ASSET: Option<&str> = None;
 
 const SUMS_ASSET: &str = "SHA256SUMS";
 const MAX_DOWNLOAD: u64 = 300 * 1024 * 1024;
@@ -60,7 +54,7 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A newer release we can install.
+/// A release with a signed asset we can install.
 #[derive(Debug, Clone)]
 pub struct Release {
     pub version: String,
@@ -97,35 +91,45 @@ fn client() -> Result<reqwest::Client> {
     // ring and aws-lc are both linked; rustls needs to be told which to use.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     Ok(reqwest::Client::builder()
-        .user_agent(concat!("storm/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("storm-update/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(10 * 60))
         .build()?)
 }
 
-/// The latest release, if it's newer than `current` and has our asset. Blocking.
-pub fn check(current: &str) -> Result<Option<Release>> {
-    let asset = ASSET.ok_or_else(|| err("no update asset for this platform"))?;
+/// The latest release, if it's newer than `current` and has `asset`. Blocking.
+pub fn check(current: &str, asset: &str) -> Result<Option<Release>> {
+    // None: no releases yet (or the repo isn't public).
+    Ok(fetch("latest".into())?.and_then(|gh| pick_release(gh, current, asset)))
+}
+
+/// Release `version` (`x.y.z`), which must carry a signed `asset`. Blocking.
+pub fn release(version: &str, asset: &str) -> Result<Release> {
+    let gh = fetch(format!("tags/v{version}"))?.ok_or_else(|| err(format!("there's no release {version}")))?;
+    complete_release(gh, asset).ok_or_else(|| err(format!("release {version} has no signed {asset}")))
+}
+
+fn fetch(which: String) -> Result<Option<GhRelease>> {
     block_on(async move {
-        let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
+        let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/{which}");
         let resp = client()?.get(url).header("Accept", "application/vnd.github+json").send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // No releases yet (or the repo isn't public).
             return Ok(None);
         }
-        let gh: GhRelease = resp.error_for_status()?.json().await?;
-        Ok(pick_release(gh, current, asset))
+        Ok(Some(resp.error_for_status()?.json().await?))
     })
 }
 
 fn pick_release(gh: GhRelease, current: &str, asset: &str) -> Option<Release> {
-    if gh.draft || gh.prerelease {
+    if gh.draft || gh.prerelease || !is_newer(gh.tag_name.trim_start_matches('v'), current) {
         return None;
     }
+    complete_release(gh, asset)
+}
+
+/// `gh` as a [`Release`], if it has `asset`, its signature and the checksums.
+fn complete_release(gh: GhRelease, asset: &str) -> Option<Release> {
     let version = gh.tag_name.trim_start_matches('v').to_owned();
-    if !is_newer(&version, current) {
-        return None;
-    }
     let url_of = |name: &str| gh.assets.iter().find(|a| a.name == name);
     let bin = url_of(asset)?;
     let sums = url_of(SUMS_ASSET)?;
@@ -142,7 +146,7 @@ fn pick_release(gh: GhRelease, current: &str, asset: &str) -> Option<Release> {
 
 /// `a > b` for plain `major.minor.patch` versions. Anything with a pre-release
 /// or unparsable part is never "newer".
-fn is_newer(a: &str, b: &str) -> bool {
+pub fn is_newer(a: &str, b: &str) -> bool {
     fn parse(v: &str) -> Option<(u64, u64, u64)> {
         let v = v.split('+').next()?;
         if v.contains('-') {
@@ -155,21 +159,19 @@ fn is_newer(a: &str, b: &str) -> bool {
     matches!((parse(a), parse(b)), (Some(a), Some(b)) if a > b)
 }
 
-/// Downloads and verifies `release`, then installs it in place of the running
-/// exe. Returns the path to restart into. Blocking.
-pub fn download_and_install(release: &Release) -> Result<PathBuf> {
+/// Downloads `release`'s asset and verifies it. Blocking.
+pub fn download(release: &Release) -> Result<Vec<u8>> {
     if release.asset_size > MAX_DOWNLOAD {
         return Err(err("update is unexpectedly large"));
     }
-    let bytes = block_on(async {
+    block_on(async {
         let http = client()?;
         let sums = http.get(&release.sums_url).send().await?.error_for_status()?.text().await?;
         let sig = http.get(&release.sig_url).send().await?.error_for_status()?.text().await?;
         let bin = http.get(&release.asset_url).send().await?.error_for_status()?.bytes().await?;
         verify(&bin, &sig, &sums, &release.asset, &release.version)?;
-        Ok(bin)
-    })?;
-    install(&bytes)
+        Ok(bin.to_vec())
+    })
 }
 
 fn verify(bin: &[u8], sig: &str, sums: &str, asset: &str, version: &str) -> Result<()> {
@@ -204,41 +206,56 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Paths next to the running exe used while swapping.
-fn sidecars(exe: &Path) -> (PathBuf, PathBuf) {
-    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "storm.exe".into());
+/// Paths next to `exe` used while swapping: `<exe>.new` and `<exe>.old`.
+pub fn sidecars(exe: &Path) -> (PathBuf, PathBuf) {
+    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "storm".into());
     (exe.with_file_name(format!("{name}.new")), exe.with_file_name(format!("{name}.old")))
 }
 
-/// Puts `bytes` in place of the running exe. Windows won't delete a running
-/// exe but will rename it, so: write `.new`, move the current one to `.old`,
-/// move `.new` into place (and roll back if that fails).
-fn install(bytes: &[u8]) -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let (new, old) = sidecars(&exe);
+/// Writes `bytes` to `<exe>.new`, executable. [`swap`] then puts it in place;
+/// in between, the caller may try running it.
+pub fn stage(exe: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let (new, _) = sidecars(exe);
     std::fs::write(&new, bytes).map_err(|e| err(format!("can't write next to {}: {e}", exe.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(new)
+}
+
+/// Moves a [`stage`]d `<exe>.new` in place of `exe`, keeping the previous one
+/// as `<exe>.old`. Windows won't delete a running exe but will rename it, so
+/// this works on the running exe too. Rolls back if the last step fails.
+pub fn swap(exe: &Path) -> Result<()> {
+    let (new, old) = sidecars(exe);
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old)?;
-    if let Err(e) = std::fs::rename(&new, &exe) {
-        let _ = std::fs::rename(&old, &exe);
+    std::fs::rename(exe, &old)?;
+    if let Err(e) = std::fs::rename(&new, exe) {
+        let _ = std::fs::rename(&old, exe);
         let _ = std::fs::remove_file(&new);
         return Err(e.into());
     }
-    Ok(exe)
+    Ok(())
 }
 
-/// Deletes what an earlier update left beside the exe. Call at startup.
-pub fn remove_leftovers() {
-    if let Ok(exe) = std::env::current_exe() {
-        let (new, old) = sidecars(&exe);
-        let _ = std::fs::remove_file(old);
-        let _ = std::fs::remove_file(new);
-    }
+/// Puts `bytes` in place of `exe`: [`stage`] then [`swap`].
+pub fn install(exe: &Path, bytes: &[u8]) -> Result<()> {
+    stage(exe, bytes)?;
+    swap(exe)
+}
+
+/// Deletes what an earlier update left beside `exe`.
+pub fn remove_leftovers(exe: &Path) {
+    let (new, old) = sidecars(exe);
+    let _ = std::fs::remove_file(old);
+    let _ = std::fs::remove_file(new);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GhAsset, GhRelease, checksum_for, is_newer, pick_release, verify};
+    use super::{GhAsset, GhRelease, checksum_for, complete_release, is_newer, pick_release, verify};
 
     // Signed with the real release key as file `test-fixture.bin`, version
     // 0.0.1 (so it can never pass as an actual update).
@@ -270,11 +287,12 @@ mod tests {
         assert!(verify(FIXTURE, FIXTURE_SIG, &wrong, "test-fixture.bin", "0.0.1").is_err());
     }
 
-    /// Talks to GitHub: `cargo test -p storm-app live_check -- --ignored`.
+    /// Talks to GitHub: `cargo test -p storm-update live_check -- --ignored`.
     #[test]
     #[ignore]
     fn live_check() {
-        println!("{:?}", super::check("0.0.0").map(|r| r.map(|r| r.version)));
+        println!("{:?}", super::check("0.0.0", "storm-windows-x86_64.exe").map(|r| r.map(|r| r.version)));
+        println!("{:?}", super::release("0.1.3", "stormd-windows-x86_64.exe").map(|r| r.version));
     }
 
     #[test]
@@ -321,5 +339,25 @@ mod tests {
         assert!(pick_release(release("v0.1.0", &all), "0.1.0", all[0]).is_none());
         assert!(pick_release(release("v0.2.0", &all[..1]), "0.1.0", all[0]).is_none());
         assert!(pick_release(release("v0.2.0", &all), "0.1.0", "stormd-windows-x86_64.exe").is_none());
+    }
+
+    #[test]
+    fn an_exact_release_needs_its_signed_asset_but_not_to_be_newer() {
+        let all = ["stormd-linux-x86_64", "stormd-linux-x86_64.minisig", "SHA256SUMS"];
+        assert_eq!(complete_release(release("v0.1.0", &all), all[0]).unwrap().version, "0.1.0");
+        assert!(complete_release(release("v0.1.0", &all[..2]), all[0]).is_none());
+    }
+
+    #[test]
+    fn install_swaps_and_keeps_the_previous_exe() {
+        let dir = std::env::temp_dir().join(format!("storm-update-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("stormd");
+        std::fs::write(&exe, b"old").unwrap();
+        super::install(&exe, b"new").unwrap();
+        let (new, old) = super::sidecars(&exe);
+        let result = (std::fs::read(&exe).unwrap(), std::fs::read(&old).unwrap(), new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, (b"new".to_vec(), b"old".to_vec(), false));
     }
 }

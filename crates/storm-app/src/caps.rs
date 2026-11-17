@@ -152,6 +152,7 @@ mod tests {
             api_version: storm_proto::API_VERSION,
             engine_version: "0".into(),
             librqbit_version: "0".into(),
+            self_update: false,
         }
     }
 

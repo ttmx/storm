@@ -137,7 +137,18 @@ pub struct StormApp {
     _search_sub: Subscription,
     _clipboard_watch: Entity<crate::views::clipboard_watch::ClipboardWatcher>,
     _updater: Entity<crate::updater::Updater>,
+    /// The server update this app asked for, until the server is back on it.
+    server_update: Option<ServerUpdate>,
 }
+
+struct ServerUpdate {
+    target: String,
+    /// The server has the new build and is restarting into it.
+    installed: bool,
+}
+
+/// How long a server gets to download, install and restart.
+const SERVER_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 impl StormApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -183,6 +194,7 @@ impl StormApp {
                 cx.set_global(crate::updater::UpdaterHandle(updater.clone()));
                 updater
             },
+            server_update: None,
         }
     }
 
@@ -218,6 +230,7 @@ impl StormApp {
         let status = cx.new(|cx| StatusBar::new(state.clone(), cx));
 
         let subs = vec![
+            cx.observe_in(&state, window, |this, _, window, cx| this.finish_server_update(window, cx)),
             cx.observe(&state, |this, state, cx| {
                 let torrents = state.read(cx).torrents.clone();
                 this.table.update(cx, |t, cx| {
@@ -256,6 +269,7 @@ impl StormApp {
         cx: &mut Context<Self>,
     ) {
         cx.set_global(BackendHandle::new(backend));
+        self.server_update = None;
         let query = self.search.read(cx).value();
         let sort = self.table.read(cx).delegate().sort();
         let parts = Self::build(&self.focus_handle, self.filter, &query, sort, window, cx);
@@ -512,6 +526,63 @@ impl StormApp {
         ConnectDialog::open(on_connected, window, cx);
     }
 
+    /// Asks the server to update to this app's version. It downloads the
+    /// release, restarts into it, and the event stream reconnects; see
+    /// [`Self::finish_server_update`].
+    fn update_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.server_update.is_some() {
+            return;
+        }
+        let target = crate::updater::current_version().to_owned();
+        self.server_update = Some(ServerUpdate { target: target.clone(), installed: false });
+        cx.notify();
+        let backend = BackendHandle::get(cx).backend;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = backend.update_server(target.clone()).await;
+            let ok = result.is_ok();
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => {
+                        if let Some(u) = this.server_update.as_mut().filter(|u| u.target == target) {
+                            u.installed = true;
+                        }
+                    }
+                    Err(e) => {
+                        this.server_update = None;
+                        ui::notify_error(window, cx, format!("Couldn't update the server: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+            if !ok {
+                return;
+            }
+            cx.background_executor().timer(SERVER_UPDATE_TIMEOUT).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.server_update.as_ref().is_some_and(|u| u.target == target) {
+                    this.server_update = None;
+                    ui::notify_error(window, cx, format!("The server didn't come back on {target}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Once the server is back on the version we asked for, says so.
+    fn finish_server_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(update) = self.server_update.as_ref().filter(|u| u.installed) else { return };
+        if !matches!(self.state.read(cx).connection, crate::state::Connection::Connected) {
+            return;
+        }
+        // Re-read on every reconnect, so this flips once the new build is up.
+        if BackendHandle::get(cx).backend.info().engine_version == update.target {
+            ui::notify_info(window, cx, format!("Server updated to {}", update.target));
+            self.server_update = None;
+            cx.notify();
+        }
+    }
+
     fn disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let local = cx.global::<LocalEngine>().0.clone();
         self.switch_backend(local, window, cx);
@@ -728,7 +799,24 @@ impl StormApp {
                 ),
             ),
         };
-        let tip: SharedString = format!("{url} · {status}").into();
+        let info = BackendHandle::get(cx).backend.info();
+        let tip: SharedString = format!("{url} · {status} · {}", info.engine_version).into();
+        let app_version = crate::updater::current_version();
+        let update = if self.server_update.is_some() {
+            Some(Button::new("update-server").xsmall().ghost().loading(true).label("Updating…").disabled(true))
+        } else if info.self_update && storm_update::is_newer(app_version, &info.engine_version) {
+            let tip: SharedString = format!("{} → {app_version}", info.engine_version).into();
+            Some(
+                Button::new("update-server")
+                    .xsmall()
+                    .ghost()
+                    .label("Update")
+                    .tooltip(tip)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.update_server(window, cx))),
+            )
+        } else {
+            None
+        };
         h_flex()
             .id("server-pill")
             .occlude()
@@ -742,6 +830,7 @@ impl StormApp {
             .text_sm()
             .child(div().size(px(7.)).flex_shrink_0().rounded_full().bg(dot))
             .child(div().max_w(px(260.)).truncate().child(host))
+            .when_some(update, |pill, button| pill.pr_1().child(button))
             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
     }
 

@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::{SinkExt, StreamExt};
 use reqwest::{Method, RequestBuilder, StatusCode};
@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use storm_proto::{
     self as proto, AddTorrentRequest, AddTorrentResponse, Backend, BackendInfo, BackendKind, DirListing, Error,
     ErrorKind, Event, EventStream, FilePriority, PeerInfo, SessionStats, Settings, SettingsPatch, StatsSample,
-    TorrentDetails, TorrentId, TorrentSummary,
+    TorrentDetails, TorrentId, TorrentSummary, UpdateServerRequest,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Handle, Runtime};
@@ -33,7 +33,9 @@ struct Inner {
     display_url: String,
     token: String,
     http: reqwest::Client,
-    info: BackendInfo,
+    /// Re-read on every (re)subscribe: the server may have restarted on
+    /// another version.
+    info: Mutex<BackendInfo>,
     rt: RuntimeHandle,
 }
 
@@ -80,7 +82,7 @@ impl RemoteBackend {
         let res = handle.spawn(fut).await;
         match res {
             Ok(Ok((api, display_url, token, http, info))) => {
-                Ok(Self { inner: Arc::new(Inner { api, display_url, token, http, info, rt }) })
+                Ok(Self { inner: Arc::new(Inner { api, display_url, token, http, info: Mutex::new(info), rt }) })
             }
             Ok(Err(e)) => Err(e),
             Err(e) => Err(Error::internal(format!("connect task failed: {e}"))),
@@ -91,7 +93,7 @@ impl RemoteBackend {
     pub async fn connect_on_current_runtime(url: &str, token: &str) -> proto::Result<Self> {
         let (api, display_url, token, http, info) = Self::connect_inner(url.to_string(), token.to_string()).await?;
         let rt = RuntimeHandle::Borrowed(Handle::current());
-        Ok(Self { inner: Arc::new(Inner { api, display_url, token, http, info, rt }) })
+        Ok(Self { inner: Arc::new(Inner { api, display_url, token, http, info: Mutex::new(info), rt }) })
     }
 
     async fn connect_inner(
@@ -110,16 +112,7 @@ impl RemoteBackend {
             .map_err(|e| Error::internal(e.to_string()))?;
         let display_url = base.as_str().trim_end_matches('/').to_string();
 
-        let resp = send(http.get(api.join("info").unwrap()).bearer_auth(&token)).await?;
-        let mut info: BackendInfo = decode(resp).await?;
-        if info.api_version != proto::API_VERSION {
-            return Err(Error::bad_request(format!(
-                "server speaks API v{}, this app speaks v{}; update the older one",
-                info.api_version,
-                proto::API_VERSION
-            )));
-        }
-        info.kind = BackendKind::Remote { url: display_url.clone() };
+        let info = fetch_info(&http, &api, &token, &display_url).await?;
         Ok((api, display_url, token, http, info))
     }
 
@@ -168,6 +161,26 @@ impl RemoteBackend {
     }
 }
 
+/// `GET /info`, checking the API version.
+async fn fetch_info(
+    http: &reqwest::Client,
+    api: &url::Url,
+    token: &str,
+    display_url: &str,
+) -> proto::Result<BackendInfo> {
+    let resp = send(http.get(api.join("info").unwrap()).bearer_auth(token)).await?;
+    let mut info: BackendInfo = decode(resp).await?;
+    if info.api_version != proto::API_VERSION {
+        return Err(Error::bad_request(format!(
+            "server speaks API v{}, this app speaks v{}; update the older one",
+            info.api_version,
+            proto::API_VERSION
+        )));
+    }
+    info.kind = BackendKind::Remote { url: display_url.to_owned() };
+    Ok(info)
+}
+
 impl Inner {
     fn request(&self, method: Method, path: &str) -> proto::Result<RequestBuilder> {
         let url = self.api.join(path).map_err(|e| Error::bad_request(e.to_string()))?;
@@ -185,11 +198,13 @@ impl Inner {
 #[async_trait::async_trait]
 impl Backend for RemoteBackend {
     fn info(&self) -> BackendInfo {
-        self.inner.info.clone()
+        self.inner.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     async fn subscribe(&self) -> proto::Result<EventStream> {
         self.run(|inner| async move {
+            let info = fetch_info(&inner.http, &inner.api, &inner.token, &inner.display_url).await?;
+            *inner.info.lock().unwrap_or_else(|e| e.into_inner()) = info;
             let mut req =
                 inner.ws_url().as_str().into_client_request().map_err(|e| Error::bad_request(e.to_string()))?;
             let auth = format!("Bearer {}", inner.token)
@@ -244,6 +259,10 @@ impl Backend for RemoteBackend {
 
     async fn add_torrent(&self, req: AddTorrentRequest) -> proto::Result<AddTorrentResponse> {
         self.send_json(Method::POST, "torrents".into(), req).await
+    }
+
+    async fn update_server(&self, version: String) -> proto::Result<()> {
+        self.send_json(Method::POST, "server/update".into(), UpdateServerRequest { version }).await
     }
 
     async fn pause(&self, id: TorrentId) -> proto::Result<()> {
