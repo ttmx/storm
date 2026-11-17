@@ -7320,7 +7320,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storm-app"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7343,7 +7343,7 @@ dependencies = [
 
 [[package]]
 name = "storm-client"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -7365,7 +7365,7 @@ dependencies = [
 
 [[package]]
 name = "storm-engine"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7384,7 +7384,7 @@ dependencies = [
 
 [[package]]
 name = "storm-proto"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7396,7 +7396,7 @@ dependencies = [
 
 [[package]]
 name = "storm-server"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -7417,7 +7417,7 @@ dependencies = [
 
 [[package]]
 name = "storm-update"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "aws-lc-rs",
  "minisign-verify",
