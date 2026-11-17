@@ -158,7 +158,14 @@ impl PieceAvailability {
     pub fn sub(&self, bitfield: &BS) {
         for piece in bitfield.iter_ones() {
             if let Some(c) = self.0.get(piece) {
-                let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+                // Saturating decrement. (Not `fetch_update`: newer toolchains deprecate it.)
+                let mut v = c.load(Ordering::Relaxed);
+                while v > 0 {
+                    match c.compare_exchange_weak(v, v - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(now) => v = now,
+                    }
+                }
             }
         }
     }
